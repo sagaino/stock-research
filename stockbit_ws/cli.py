@@ -400,7 +400,7 @@ def main(argv=None):
         if args.record:
             recorder = PostgresRecorder(symbol, dashboard.started_at, args.stale_after)
             dashboard.recorder = recorder
-            logger.lifecycle(f"Recording session: {recorder.session_id}")
+            logger.lifecycle(f"Recording session: {recorder.session_id} (hanya event 'book' & 'done' disimpan)")
     except RecordingError as error:
         logger.error(str(error))
         return 1

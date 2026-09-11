@@ -61,30 +61,60 @@ def initialize_schema(connection):
             kind text NOT NULL CHECK(kind IN ('connection','message','book','done')),
             payload jsonb NOT NULL, PRIMARY KEY(session_id,seq)
         )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS stockbit_ws.trades (
+            id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            session_id text NOT NULL REFERENCES stockbit_ws.sessions(id) ON DELETE CASCADE,
+            trade_id numeric,
+            symbol text NOT NULL,
+            price numeric NOT NULL,
+            shares numeric NOT NULL,
+            lot numeric NOT NULL,
+            side text NOT NULL CHECK(side IN ('BUY', 'SELL')),
+            aggressor text NOT NULL CHECK(aggressor IN ('HAKA', 'HAKI')),
+            trade_timestamp timestamptz NOT NULL,
+            received_at timestamptz NOT NULL,
+            transaction_value numeric NOT NULL,
+            flag integer
+        )""")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_trades_sym_ts ON stockbit_ws.trades(symbol, trade_timestamp DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_trades_sess_ts ON stockbit_ws.trades(session_id, trade_timestamp DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON stockbit_ws.trades(trade_timestamp DESC)")
 
 
 class PostgresRecorder:
-    def __init__(self, symbol, started_at, stale_after=15.0, *, source="LIVE"):
+    def __init__(self, symbol, started_at, stale_after=15.0, *, source="LIVE", allowed_kinds=None, only_done=None):
         self.connection = None
         self.session_id = uuid.uuid4().hex
         self.symbol = symbol
+        self.source = source
         self.sequence = self.last_elapsed = 0
         self.closed = False
+        # Default: LIVE recordings save 'book' and 'done' (dropping 'message' and 'connection' noise);
+        # SYNTHETIC test fixtures retain all kinds unless overridden.
+        if allowed_kinds is not None:
+            self.allowed_kinds = set(allowed_kinds)
+        elif only_done is True:
+            self.allowed_kinds = {"done"}
+        elif source == "LIVE":
+            self.allowed_kinds = {"book", "done"}
+        else:
+            self.allowed_kinds = None
         try:
             if (symbol != "*" and not SYMBOL_PATTERN.fullmatch(symbol)) or source not in ("LIVE", "SYNTHETIC") or number(stale_after, minimum=0) == 0:
                 raise ValueError("Invalid session")
-            started = timestamp_text(started_at)
             self.connection = connect_database()
             initialize_schema(self.connection)
-            self.connection.execute("""INSERT INTO stockbit_ws.sessions
-                (id,symbol,started_at,stale_after,status,source) VALUES (%s,%s,%s,%s,'OPEN',%s)""",
-                (self.session_id, symbol, started, stale_after, source))
-        except (psycopg.Error, ValueError, TypeError):
-            self._dispose()
-            raise RecordingError("Sesi PostgreSQL tidak dapat dibuat; periksa schema dan akses database.") from None
-        except RecordingError:
-            self._dispose()
-            raise
+            self.connection.execute(
+                "INSERT INTO stockbit_ws.sessions (id, symbol, started_at, stale_after, status, source) VALUES (%s,%s,%s,%s,'OPEN',%s)",
+                (self.session_id, symbol, timestamp_text(started_at), stale_after, source)
+            )
+        except (psycopg.Error, ValueError, TypeError, KeyError, AttributeError, OverflowError):
+            if self.connection is not None:
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+            raise RecordingError("Sesi perekaman PostgreSQL gagal diinisialisasi.") from None
 
     def _dispose(self):
         if self.connection is not None:
@@ -94,11 +124,46 @@ class PostgresRecorder:
     def append(self, kind, payload, received_at, elapsed):
         if self.closed:
             raise RecordingError("Sesi rekaman sudah ditutup.")
+        # Filter out noise events ('message', 'connection') in live sessions
+        if self.allowed_kinds is not None and kind in ("message", "connection") and kind not in self.allowed_kinds:
+            return
+        if self.allowed_kinds is not None and self.allowed_kinds == {"done"} and kind in ("book", "message", "connection"):
+            return
         try:
-            encoded, received, elapsed_ms = serialize_event(kind, payload, self.symbol, received_at, elapsed, self.last_elapsed)
+            encoded, received, elapsed_ms, safe = serialize_event(kind, payload, self.symbol, received_at, elapsed, self.last_elapsed)
             # ponytail: one committed INSERT per event; batch only after measuring I/O.
             self.connection.execute("INSERT INTO stockbit_ws.events VALUES (%s,%s,%s,%s,%s,%s::jsonb)",
                                     (self.session_id, self.sequence + 1, received, elapsed_ms, kind, encoded))
+            
+            # Normalize trades into stockbit_ws.trades table for instant relational querying
+            if kind == "done":
+                trades = safe.get("trades", [])
+                if trades:
+                    trade_rows = [
+                        (
+                            self.session_id,
+                            t.get("tradeId"),
+                            t.get("symbol") or self.symbol,
+                            t.get("price"),
+                            t.get("shares"),
+                            t.get("lot"),
+                            t.get("side"),
+                            t.get("aggressor"),
+                            t.get("timestamp"),
+                            received,
+                            t.get("transactionValue"),
+                            t.get("flag"),
+                        )
+                        for t in trades if t.get("price") is not None
+                    ]
+                    if trade_rows:
+                        self.connection.cursor().executemany(
+                            """INSERT INTO stockbit_ws.trades (
+                                session_id, trade_id, symbol, price, shares, lot,
+                                side, aggressor, trade_timestamp, received_at, transaction_value, flag
+                            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                            trade_rows,
+                        )
             self.sequence += 1
             self.last_elapsed = elapsed_ms
         except (psycopg.Error, ValueError, TypeError, KeyError, AttributeError, OverflowError):

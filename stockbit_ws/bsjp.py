@@ -71,16 +71,14 @@ def run_screening(
     cur.execute("""
     WITH trades_raw AS (
         SELECT 
-            t->>'symbol' as symbol,
-            (t->>'price')::numeric as price,
-            (t->>'shares')::numeric as shares,
-            (t->>'sideCode')::int as side_code,
-            (t->>'transactionValue')::numeric as val,
-            (t->>'timestamp')::timestamptz as ts
-        FROM stockbit_ws.events e,
-             jsonb_array_elements(e.payload->'trades') t
-        WHERE e.session_id = ANY(%s)
-          AND e.kind = 'done'
+            symbol,
+            price,
+            shares,
+            (CASE WHEN side = 'BUY' OR aggressor = 'HAKA' THEN 1 ELSE 2 END) as side_code,
+            transaction_value as val,
+            trade_timestamp as ts
+        FROM stockbit_ws.trades
+        WHERE session_id = ANY(%s)
     ),
     day_summary AS (
         SELECT 

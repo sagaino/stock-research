@@ -23,7 +23,7 @@ def serialize_event(kind, payload, symbol, received_at, elapsed, last_elapsed):
     elapsed_ms = round(number(elapsed, minimum=0) * 1000)
     if elapsed_ms < last_elapsed:
         raise ValueError("Clock moved backwards")
-    return encoded, timestamp_text(received_at), elapsed_ms
+    return encoded, timestamp_text(received_at), elapsed_ms, safe
 
 
 def validate_session(row):
