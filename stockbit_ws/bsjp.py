@@ -187,6 +187,73 @@ def run_screening(
     }
 
 
+def enrich_with_broker_data(
+    conn,
+    candidates: list[dict[str, Any]],
+    date: datetime.date | None = None,
+) -> list[dict[str, Any]]:
+    """Enrich screening candidates dengan data broker dari broker_stock_activity.
+    
+    Untuk setiap candidate, query top 3 buyer dan top 3 seller berdasarkan net_value.
+    Tambahkan field baru: broker_top_buyers, broker_top_sellers, broker_net_total, broker_conviction.
+    """
+    try:
+        conn.execute("SELECT 1 FROM stockbit_ws.broker_stock_activity LIMIT 0")
+    except Exception:
+        return candidates
+    
+    if date is None:
+        row = conn.execute(
+            "SELECT max(date) as d FROM stockbit_ws.broker_stock_activity"
+        ).fetchone()
+        if not row or not row.get("d"):
+            return candidates
+        date = row["d"]
+    
+    cur = conn.cursor()
+    for candidate in candidates:
+        symbol = candidate["symbol"]
+        
+        buyers = cur.execute("""
+            SELECT broker_code, net_value, buy_avg_price, buy_lot_pct
+            FROM stockbit_ws.broker_stock_activity
+            WHERE date = %s AND symbol = %s AND net_value > 0
+            ORDER BY net_value DESC LIMIT 3
+        """, (date, symbol)).fetchall()
+        
+        sellers = cur.execute("""
+            SELECT broker_code, net_value, sell_avg_price, sell_lot_pct
+            FROM stockbit_ws.broker_stock_activity
+            WHERE date = %s AND symbol = %s AND net_value < 0
+            ORDER BY net_value ASC LIMIT 3
+        """, (date, symbol)).fetchall()
+        
+        agg = cur.execute("""
+            SELECT sum(CASE WHEN net_value > 0 THEN net_value ELSE 0 END) as total_buy_net,
+                   sum(CASE WHEN net_value < 0 THEN net_value ELSE 0 END) as total_sell_net
+            FROM stockbit_ws.broker_stock_activity
+            WHERE date = %s AND symbol = %s
+        """, (date, symbol)).fetchone()
+        
+        candidate["broker_top_buyers"] = [
+            {"code": b["broker_code"], "net": float(b["net_value"] or 0), "avg_price": float(b["buy_avg_price"] or 0)}
+            for b in buyers
+        ]
+        candidate["broker_top_sellers"] = [
+            {"code": s["broker_code"], "net": float(s["net_value"] or 0)}
+            for s in sellers
+        ]
+        
+        total_buy_net = float(agg["total_buy_net"] or 0) if agg else 0
+        total_sell_net = float(agg["total_sell_net"] or 0) if agg else 0
+        candidate["broker_net_total"] = (total_buy_net + total_sell_net) / 1e9
+        
+        denom = abs(total_buy_net) + abs(total_sell_net)
+        candidate["broker_conviction"] = (total_buy_net + total_sell_net) / denom if denom > 0 else 0
+    
+    return candidates
+
+
 def generate_recommendations(top_picks: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Build actionable trading plans for top picks."""
     recs = []
@@ -250,18 +317,25 @@ def format_report_markdown(date_str: str, results: dict[str, Any], recommendatio
         f"### 🥇 Tabel Saham Trading / Scalping Lolos Filter (Mid & Small Cap)",
         f"*Kriteria: Omset >= Rp 5 Miliar, Trades >= 3.000, Net Buy Harian > 0, Close >= 95% HOD*",
         f"",
-        f"| Rank | Symbol | Close (% HOD) | Trades | Total Val | Net Harian | Val 14:00+ | HAKA 14+ | Net 14:00+ | Val 15:00+ | HAKA 15+ | Net 15:00+ | Net 15m Akhir |",
-        f"| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+        f"| Rank | Symbol | Close (% HOD) | Trades | Total Val | Net Harian | Val 14:00+ | HAKA 14+ | Net 14:00+ | Val 15:00+ | HAKA 15+ | Net 15:00+ | Net 15m Akhir | Top Buyer (Net) | Broker Score |",
+        f"| :---: | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
     ])
 
     for i, r in enumerate(tc, 1):
         rank_badge = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}"
+        top_buyer_str = ""
+        if r.get("broker_top_buyers"):
+            b = r["broker_top_buyers"][0]
+            top_buyer_str = f"{b['code']} (+{b['net']/1e9:.1f}B)"
+        conviction = r.get("broker_conviction", 0)
+        conviction_emoji = "🟢" if conviction > 0.3 else "🟡" if conviction > 0 else "🔴"
+        
         lines.append(
             f"| {rank_badge} | **{r['symbol']}** | {float(r['close_p']):.0f} *({float(r['hod_pct']):.1f}%)* | "
             f"{r['total_trades']:,} | Rp {float(r['total_val_b']):.2f} B | +Rp {float(r['total_net_b']):.2f} B | "
             f"Rp {float(r['val_14_b'] or 0):.2f} B | {float(r['haka_14_pct'] or 0):.1f}% | +Rp {float(r['net_14_b'] or 0):.2f} B | "
             f"Rp {float(r['val_15_b'] or 0):.2f} B | **{float(r['haka_15_pct'] or 0):.1f}%** | **+Rp {float(r['net_15_b'] or 0):.2f} B** | "
-            f"{float(r['net_1535_b'] or 0):+.2f} B |"
+            f"{float(r['net_1535_b'] or 0):+.2f} B | {top_buyer_str} | {conviction_emoji} {conviction:+.2f} |"
         )
 
     if bc:
@@ -272,16 +346,23 @@ def format_report_markdown(date_str: str, results: dict[str, Any], recommendatio
             f"### 🏛️ Kategori Khusus: Big Cap Inflow Raksasa (> Rp 90 Miliar)",
             f"*Saham berkapitalisasi besar dengan likuiditas institusi raksasa untuk kapasitas modal besar:*",
             f"",
-            f"| Symbol | Close (% HOD) | Trades | Total Val | Net Harian | Val 14:00+ | HAKA 14+ | Net 14:00+ | Val 15:00+ | HAKA 15+ | Net 15:00+ | Net 15m Akhir |",
-            f"| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
+            f"| Symbol | Close (% HOD) | Trades | Total Val | Net Harian | Val 14:00+ | HAKA 14+ | Net 14:00+ | Val 15:00+ | HAKA 15+ | Net 15:00+ | Net 15m Akhir | Top Buyer (Net) | Broker Score |",
+            f"| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |",
         ])
         for r in bc:
+            top_buyer_str = ""
+            if r.get("broker_top_buyers"):
+                b = r["broker_top_buyers"][0]
+                top_buyer_str = f"{b['code']} (+{b['net']/1e9:.1f}B)"
+            conviction = r.get("broker_conviction", 0)
+            conviction_emoji = "🟢" if conviction > 0.3 else "🟡" if conviction > 0 else "🔴"
+            
             lines.append(
                 f"| **{r['symbol']}** | {float(r['close_p']):.0f} *({float(r['hod_pct']):.1f}%)* | "
                 f"{r['total_trades']:,} | Rp {float(r['total_val_b']):.2f} B | +Rp {float(r['total_net_b']):.2f} B | "
                 f"Rp {float(r['val_14_b'] or 0):.2f} B | {float(r['haka_14_pct'] or 0):.1f}% | +Rp {float(r['net_14_b'] or 0):.2f} B | "
                 f"Rp {float(r['val_15_b'] or 0):.2f} B | **{float(r['haka_15_pct'] or 0):.1f}%** | **+Rp {float(r['net_15_b'] or 0):.2f} B** | "
-                f"{float(r['net_1535_b'] or 0):+.2f} B |"
+                f"{float(r['net_1535_b'] or 0):+.2f} B | {top_buyer_str} | {conviction_emoji} {conviction:+.2f} |"
             )
 
     if ab:
@@ -344,6 +425,10 @@ def main():
             min_hod_pct=args.min_hod,
             exclude_index_banks=True,
         )
+
+        enrich_with_broker_data(conn, results["trading_candidates"])
+        enrich_with_broker_data(conn, results["big_cap_candidates"])
+        enrich_with_broker_data(conn, results["absorption_candidates"])
 
         all_top = results["trading_candidates"] + results["big_cap_candidates"]
         recs = generate_recommendations(all_top)

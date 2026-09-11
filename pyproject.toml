@@ -14,6 +14,7 @@ dependencies = [
     "psycopg[binary]>=3.2,<4",
     "fastapi>=0.115",
     "uvicorn>=0.30",
+    "httpx>=0.28.1",
 ]
 
 [project.scripts]
@@ -25,11 +26,12 @@ stockbit-intervals = "stockbit_ws.intervals:main"
 stockbit-radar = "stockbit_ws.radar:main"
 stockbit-sniper = "stockbit_ws.sniper:main"
 stockbit-bsjp = "stockbit_ws.bsjp:main"
+stockbit-exodus = "stockbit_ws.exodus:main"
+stockbit-l2 = "stockbit_ws.exodus_l2:main"
+stockbit-phase3 = "stockbit_ws.phase3_scanner:main"
 
 [tool.setuptools.packages.find]
 include = ["stockbit_ws*"]
 
 [dependency-groups]
-dev = [
-    "httpx>=0.28.1",
-]
+dev = []

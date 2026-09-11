@@ -328,21 +328,18 @@ source = { editable = "." }
 dependencies = [
     { name = "certifi" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "psycopg", extra = ["binary"] },
     { name = "python-dotenv" },
     { name = "uvicorn" },
     { name = "websockets" },
 ]
 
-[package.dev-dependencies]
-dev = [
-    { name = "httpx" },
-]
-
 [package.metadata]
 requires-dist = [
     { name = "certifi", specifier = ">=2025.1.31" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2,<4" },
     { name = "python-dotenv", specifier = ">=1.1,<2" },
     { name = "uvicorn", specifier = ">=0.30" },
@@ -350,7 +347,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
-dev = [{ name = "httpx", specifier = ">=0.28.1" }]
+dev = []
 
 [[package]]
 name = "typing-extensions"

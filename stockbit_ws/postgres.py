@@ -80,6 +80,56 @@ def initialize_schema(connection):
         connection.execute("CREATE INDEX IF NOT EXISTS idx_trades_sess_ts ON stockbit_ws.trades(session_id, trade_timestamp DESC)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_trades_ts ON stockbit_ws.trades(trade_timestamp DESC)")
 
+        # Exodus Broker API EOD tables
+        connection.execute("""CREATE TABLE IF NOT EXISTS stockbit_ws.broker_top_daily (
+            date date NOT NULL,
+            broker_code text NOT NULL,
+            broker_name text,
+            total_value numeric NOT NULL,
+            net_value numeric NOT NULL,
+            buy_value numeric NOT NULL,
+            sell_value numeric NOT NULL,
+            total_volume numeric,
+            total_frequency integer,
+            broker_group text,
+            fetched_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (date, broker_code)
+        )""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS stockbit_ws.broker_stock_activity (
+            date date NOT NULL,
+            broker_code text NOT NULL,
+            symbol text NOT NULL,
+            net_value numeric,
+            buy_value numeric,
+            sell_value numeric,
+            buy_lot numeric,
+            sell_lot numeric,
+            buy_avg_price numeric,
+            sell_avg_price numeric,
+            buy_lot_pct numeric,
+            sell_lot_pct numeric,
+            fetched_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (date, broker_code, symbol)
+        )""")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_broker_stock_sym_date ON stockbit_ws.broker_stock_activity(symbol, date DESC)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_broker_top_date ON stockbit_ws.broker_top_daily(date DESC)")
+        connection.execute("""CREATE TABLE IF NOT EXISTS stockbit_ws.broker_l2_ticks (
+            id text PRIMARY KEY,
+            date date NOT NULL,
+            time time NOT NULL,
+            symbol text NOT NULL,
+            price numeric,
+            lot numeric,
+            action text,
+            buyer_code text,
+            seller_code text,
+            buyer_type text,
+            seller_type text,
+            trade_number bigint
+        )""")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_l2_ticks_date_symbol ON stockbit_ws.broker_l2_ticks(date, symbol)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_l2_ticks_trade_number ON stockbit_ws.broker_l2_ticks(trade_number)")
+
 
 class PostgresRecorder:
     def __init__(self, symbol, started_at, stale_after=15.0, *, source="LIVE", allowed_kinds=None, only_done=None):
