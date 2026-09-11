@@ -1,0 +1,45 @@
+name: stockbit-ws
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:${PG_PORT:-5433}:5432"
+    environment:
+      POSTGRES_USER: ${PG_USER:-stockbit}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-stockbit_local}
+      POSTGRES_DB: ${PG_DATABASE:-stockbit_ws}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  pgadmin:
+    image: dpage/pgadmin4:9.17
+    ports:
+      - "127.0.0.1:${PGADMIN_PORT:-5051}:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@example.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-stockbit_admin_local}
+      PGADMIN_DISABLE_POSTFIX: "1"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+      - ./docker/pgadmin-servers.json:/pgadmin4/servers.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/venv/bin/python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1/misc/ping', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      start_period: 30s
+      retries: 12
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  pgadmin_data:

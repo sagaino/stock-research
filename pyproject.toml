@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stockbit-ws-local"
+version = "0.1.0"
+description = "Local read-only Stockbit WebSocket capture replay and market-data CLI"
+requires-python = ">=3.11"
+dependencies = [
+    "websockets>=17.0.1,<18",
+    "python-dotenv>=1.1,<2",
+    "certifi>=2025.1.31",
+    "psycopg[binary]>=3.2,<4",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+stockbit-ws = "stockbit_ws.cli:main"
+stockbit-inspect = "stockbit_ws.inspection:main"
+stockbit-api = "stockbit_ws.api:main"
+stockbit-report = "stockbit_ws.report:main"
+stockbit-intervals = "stockbit_ws.intervals:main"
+stockbit-radar = "stockbit_ws.radar:main"
+stockbit-sniper = "stockbit_ws.sniper:main"
+stockbit-bsjp = "stockbit_ws.bsjp:main"
+
+[tool.setuptools.packages.find]
+include = ["stockbit_ws*"]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+]
