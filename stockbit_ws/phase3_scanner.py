@@ -183,9 +183,9 @@ def generate_session_story(ticks):
         haka_val = sum(t['lot'] * 100 * t['price'] for t in p_ticks if t['action'] == 'buy')
         haka_pct = (haka_val / total_val * 100) if total_val else 50.0
         
-        haka_buyers = defaultdict(float)
-        haki_sellers = defaultdict(float)
-        net_brokers = defaultdict(float)
+        haka_buyers = defaultdict(lambda: {'lot': 0, 'val': 0.0, 'prices': []})
+        haki_sellers = defaultdict(lambda: {'lot': 0, 'val': 0.0, 'prices': []})
+        net_brokers = defaultdict(lambda: {'buy_lot': 0, 'buy_val': 0.0, 'sell_lot': 0, 'sell_val': 0.0})
         
         for t in p_ticks:
             val = t['lot'] * 100 * t['price']
@@ -193,17 +193,32 @@ def generate_session_story(ticks):
             scode = t['seller_code'].split()[0] if t['seller_code'] else None
             
             if t['action'] == 'buy' and bcode:
-                haka_buyers[bcode] += val
+                haka_buyers[bcode]['lot'] += t['lot']
+                haka_buyers[bcode]['val'] += val
+                haka_buyers[bcode]['prices'].append(t['price'])
             elif t['action'] == 'sell' and scode:
-                haki_sellers[scode] += val
+                haki_sellers[scode]['lot'] += t['lot']
+                haki_sellers[scode]['val'] += val
+                haki_sellers[scode]['prices'].append(t['price'])
                 
-            if bcode: net_brokers[bcode] += val
-            if scode: net_brokers[scode] -= val
+            if bcode:
+                net_brokers[bcode]['buy_lot'] += t['lot']
+                net_brokers[bcode]['buy_val'] += val
+            if scode:
+                net_brokers[scode]['sell_lot'] += t['lot']
+                net_brokers[scode]['sell_val'] += val
             
-        top_haka = sorted(haka_buyers.items(), key=lambda x: x[1], reverse=True)[:3]
-        top_haki = sorted(haki_sellers.items(), key=lambda x: x[1], reverse=True)[:3]
-        top_net_buy = sorted([x for x in net_brokers.items() if x[1] > 0], key=lambda x: x[1], reverse=True)[:2]
-        top_net_sell = sorted([x for x in net_brokers.items() if x[1] < 0], key=lambda x: x[1])[:2]
+        top_haka = sorted(haka_buyers.items(), key=lambda x: x[1]['val'], reverse=True)[:3]
+        top_haki = sorted(haki_sellers.items(), key=lambda x: x[1]['val'], reverse=True)[:3]
+        
+        net_summary = []
+        for b, d in net_brokers.items():
+            net_val = d['buy_val'] - d['sell_val']
+            net_lot = d['buy_lot'] - d['sell_lot']
+            net_summary.append((b, net_val, net_lot))
+
+        top_net_buy = sorted([x for x in net_summary if x[1] > 0 and x[2] > 0], key=lambda x: x[1], reverse=True)[:2]
+        top_net_sell = sorted([x for x in net_summary if x[1] < 0 and x[2] < 0], key=lambda x: x[1])[:2]
         
         results.append({
             "window": f"{t_start[:5]} - {t_end[:5]}",
@@ -305,7 +320,7 @@ def main():
     print("\n[3] AGGRESSIVE SWEEPS (Sapu Rata):")
     if sweeps:
         for x in sweeps:
-            print(f"    - Jam {x['time']} | {x['broker']} sapu {len(x['prices'])} level {x['prices']} ({format_rupiah(x['total_value'])})")
+            print(f"    - Jam {x['time']} | {x['broker']} sapu {len(x['prices'])} level {x['prices']} | {x['total_lot']:,} lot ({format_rupiah(x['total_value'])})")
     else:
         print("    Nihil")
         
@@ -313,16 +328,42 @@ def main():
     print("📜 [4] REKONSTRUKSI PERJALANAN HARGA & ALIRAN DANA (INTRADAY STORY):")
     for phase in story_phases:
         chg_sign = '+' if phase['pct_chg'] > 0 else ''
-        haka_str = ', '.join([f"{b} ({format_rupiah(v)})" for b, v in phase['top_haka']]) or "Nihil"
-        haki_str = ', '.join([f"{s} ({format_rupiah(v)})" for s, v in phase['top_haki']]) or "Nihil"
-        net_buy_str = ', '.join([f"{b} (+{format_rupiah(v)})" for b, v in phase['top_net_buy']]) or "Nihil"
-        net_sell_str = ', '.join([f"{s} (-{format_rupiah(abs(v))})" for s, v in phase['top_net_sell']]) or "Nihil"
+        
+        # Format HAKA details
+        haka_items = []
+        for b, d in phase['top_haka']:
+            avg_p = d['val'] / (d['lot'] * 100) if d['lot'] else 0
+            min_p, max_p = min(d['prices']), max(d['prices'])
+            haka_items.append(f"{b} ({d['lot']:,} lot | {format_rupiah(d['val'])} | Avg: {avg_p:.1f} [{min_p:.0f}-{max_p:.0f}])")
+        haka_str = '\n      ► ' + '\n      ► '.join(haka_items) if haka_items else "Nihil"
+
+        # Format HAKI details
+        haki_items = []
+        for s, d in phase['top_haki']:
+            avg_p = d['val'] / (d['lot'] * 100) if d['lot'] else 0
+            min_p, max_p = min(d['prices']), max(d['prices'])
+            haki_items.append(f"{s} ({d['lot']:,} lot | {format_rupiah(d['val'])} | Avg: {avg_p:.1f} [{min_p:.0f}-{max_p:.0f}])")
+        haki_str = '\n      ► ' + '\n      ► '.join(haki_items) if haki_items else "Nihil"
+
+        # Format Net Buy details
+        net_buy_items = []
+        for b, n_val, n_lot in phase['top_net_buy']:
+            avg_p = n_val / (n_lot * 100) if n_lot else 0
+            net_buy_items.append(f"{b} (+{n_lot:,} lot | +{format_rupiah(n_val)} | Avg: {avg_p:.1f})")
+        net_buy_str = ', '.join(net_buy_items) if net_buy_items else "Nihil"
+
+        # Format Net Sell details
+        net_sell_items = []
+        for s, n_val, n_lot in phase['top_net_sell']:
+            avg_p = abs(n_val) / (abs(n_lot) * 100) if n_lot else 0
+            net_sell_items.append(f"{s} (-{abs(n_lot):,} lot | -{format_rupiah(abs(n_val))} | Avg: {avg_p:.1f})")
+        net_sell_str = ', '.join(net_sell_items) if net_sell_items else "Nihil"
         
         print(f"\n[{phase['window']}] {phase['name']}")
         print(f"  • Rentang Harga  : {phase['open']:.0f} ➔ {phase['close']:.0f} ({chg_sign}{phase['pct_chg']:.1f}%) | High: {phase['high']:.0f}, Low: {phase['low']:.0f}")
-        print(f"  • Total Transaksi: {phase['total_lot']:,} lot ({format_rupiah(phase['total_val'])}) | Dominasi: {phase['haka_pct']:.1f}% HAKA vs {100-phase['haka_pct']:.1f}% HAKI")
-        print(f"  • Top HAKA (Agresif Buy) : {haka_str}")
-        print(f"  • Top HAKI (Agresif Sell): {haki_str}")
+        print(f"  • Total Turnover : {phase['total_lot']:,} lot ({format_rupiah(phase['total_val'])}) | Dominasi: {phase['haka_pct']:.1f}% HAKA vs {100-phase['haka_pct']:.1f}% HAKI")
+        print(f"  • Top HAKA (Agresif Buy) :{haka_str}")
+        print(f"  • Top HAKI (Agresif Sell):{haki_str}")
         print(f"  • Net Akumulasi : {net_buy_str}")
         print(f"  • Net Distribusi: {net_sell_str}")
     print()
