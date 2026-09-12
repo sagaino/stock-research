@@ -35,6 +35,7 @@ def run_swing_confluence(
     lookback_days: int = 5,
     min_total_turnover: float = 10_000_000_000, # Min 10B total over lookback
     max_margin_pct: float = 6.0,
+    auto_fetch_l2: bool = True,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Execute Multi-Day Accumulation + Day-T Microstructure Confluence."""
     conn = connect_database()
@@ -155,6 +156,27 @@ def run_swing_confluence(
             "all_buyers": [b for b in broker_rankings if b["net_val"] > 0][:3],
             "all_sellers": [b for b in broker_rankings if b["net_val"] < 0][-3:],
         }
+
+    # 3B. Targeted L2 Auto-Fetch for Top Candidates (HANYA AMBIL 10-15 SAHAM TERPILIH)
+    top_candidate_syms = sorted(macro_candidates.keys(), key=lambda s: macro_candidates[s]["smart_net"], reverse=True)[:15]
+    
+    if auto_fetch_l2 and top_candidate_syms:
+        cur.execute("""
+            SELECT DISTINCT symbol 
+            FROM stockbit_ws.broker_l2_ticks 
+            WHERE date = %s AND symbol = ANY(%s)
+        """, (target_date, top_candidate_syms))
+        existing_l2 = {r["symbol"] for r in cur.fetchall()}
+        missing_l2 = [s for s in top_candidate_syms if s not in existing_l2]
+
+        if missing_l2:
+            print(f"\n🎯 [TARGETED L2 SNIPER] Ditemukan {len(missing_l2)} saham top akumulasi 5D yang belum memiliki data L2 di {target_date}.")
+            print(f"⚡ Menyedot data L2 khusus untuk: {', '.join(missing_l2)} (Hanya ~30 detik, bukan 7 jam!)...")
+            try:
+                from stockbit_ws.exodus_l2 import run_ingestion
+                run_ingestion(target_date, symbols=missing_l2)
+            except Exception as e:
+                print(f"⚠️ Gagal menarik L2 otomatis: {e}. Melanjutkan analisis...")
 
     # 4. Cross-reference with Day-T (Latest Day) Microstructure in broker_l2_ticks
     cur.execute("""
@@ -354,6 +376,7 @@ def main():
     parser.add_argument("--days", type=int, default=5, help="Number of trading days lookback (default: 5)")
     parser.add_argument("--min-val", type=float, default=10_000_000_000, help="Minimum total turnover IDR (default: 10B)")
     parser.add_argument("--max-margin", type=float, default=6.0, help="Maximum margin above bandar cost (default: 6%%)")
+    parser.add_argument("--no-l2", action="store_true", help="Disable automatic L2 targeted fetching")
     args = parser.parse_args()
 
     conn = connect_database()
@@ -375,7 +398,8 @@ def main():
         target_date,
         lookback_days=args.days,
         min_total_turnover=args.min_val,
-        max_margin_pct=args.max_margin
+        max_margin_pct=args.max_margin,
+        auto_fetch_l2=not args.no_l2,
     )
 
     date_range_str = f"{dates[0]} s/d {dates[-1]}" if dates else target_date
