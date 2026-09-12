@@ -254,3 +254,106 @@ Test Python memakai data sintetis dan server WebSocket lokal; tidak membaca `.en
 - Terhubung tetapi belum ada data: lihat metadata `--debug`. Jangan menganggap koneksi terbuka berarti authentication/subscription sudah diterima.
 
 Urutan rollout, perbedaan yang disengaja, dan hasil verifikasi tercatat di [panduan migrasi](docs/MIGRATION.md).
+
+---
+
+## 🏛️ Smart Money & Bandarmologi Intelligence Suite
+
+Suite analisis data institusional dan mikrostruktur bursa berbasis data resmi bursa Stockbit (Exodus API & Running Trade L2):
+
+```text
+┌──────────────────────────────────────────────────────────────────────────┐
+│                   SUITE INTELIJEN PASAR & BANDARMOLOGI                   │
+└──────────────────────────────────────────────────────────────────────────┘
+  1. Ingestion Layer:
+     • stockbit-exodus     : Sedot Rangkuman EOD Top Broker & Portofolio
+     • stockbit-l2         : Sedot Running Trade L2 Detik-per-Detik (Heavy Duty)
+  
+  2. Analytics & Forensics Layer:
+     • stockbit-phase3     : Forensik Rekonstruksi Intraday (Iceberg, Absorpsi, Sweep)
+  
+  3. Actionable Signal Generators:
+     • stockbit-confluence : Mesin Sinyal BPJU / Scalping Pagi (5 Pilar Confluence)
+     • stockbit-swing      : Mesin Sinyal Swing Multi-Day (Targeted L2 Sniper Funnel)
+```
+
+### 1. Ingestion Data Exodus & L2
+
+#### A. Rangkuman Broker EOD (`stockbit-exodus`)
+Menyedot data ranking broker dan portofolio belanjaan 20 broker teratas:
+```bash
+uv run stockbit-exodus                    # Menarik data hari bursa terakhir
+uv run stockbit-exodus --date 2026-09-11  # Menarik tanggal historis tertentu
+```
+*Tabel Database:* `stockbit_ws.broker_top_daily` & `stockbit_ws.broker_stock_activity`.
+
+#### B. Running Trade L2 Detik-per-Detik (`stockbit-l2`)
+Mesin penyedot *Heavy Duty* dilengkapi pelindung **Auto-Resume** (melanjutkan dari titik terakhir), **Dynamic Pacing** (1-1.5s delay), dan **Smart Backoff** (istirahat 60s saat 503/429):
+```bash
+# Mode Targeted (Cepat - Hanya butuh 10-30 detik):
+uv run stockbit-l2 --symbols ANTM,AALI,PTBA --date 2026-09-11
+
+# Mode Wildcard Seluruh Pasar (Mengeruk ±1.9 Juta transaksi IHSG):
+uv run stockbit-l2 --wildcard --date 2026-09-11
+```
+*Tabel Database:* `stockbit_ws.broker_l2_ticks`.
+
+---
+
+### 2. Forensik Mikrostruktur Saham (`stockbit-phase3`)
+
+Membongkar taktik rahasia bandar dan merekonstruksi kronologi perjalanan harga dari jam 09:00 sampai 16:15 sore:
+```bash
+uv run stockbit-phase3 --symbol MUTU --date 2026-09-11
+uv run stockbit-phase3 --symbol VKTR --date 2026-09-11
+```
+
+**Fitur Analisis:**
+- **[1] Iceberg Detector:** Melacak bot bandar yang memecah order raksasa menjadi puluhan lot kecil.
+- **[2] Absorption Detector:** Mendeteksi broker institusi yang menampung guyuran kepanikan ritel di harga dasar.
+- **[3] Aggressive Sweeps:** Menangkap momen saat bandar menyapu *offer* di 3+ level harga dalam hitungan detik.
+- **[4] Intraday Story Timeline:** Rekonstruksi babak demi babak (Pagi, Siang, Sore) lengkap dengan **Lot**, **Nilai Rp**, **Harga Rata-rata (Avg)**, dan **Rentang Harga [Min-Max]**.
+- **[5] Broker Summary EOD Replica:** Tabel net broker harian 100% identik dengan tampilan resmi Stockbit.
+
+---
+
+### 3. Sinyal BPJU / Scalping Pagi (`stockbit-confluence`)
+
+Sinyal **Beli Pagi Jual Untung (BPJU)** berbasis **5 Pilar Confluence Anti-Ritel Trap** untuk mengamankan profit **+2.0% s/d +5.0%** di pagi hari:
+```bash
+uv run stockbit-confluence                    # Tanggal terbaru
+uv run stockbit-confluence --date 2026-09-11  # Tanggal spesifik
+```
+
+**Kriteria Seleksi (5 Pilar):**
+1. Pembeli utama (*Top 1 Net Buyer*) **wajib** broker institusi/asing, bukan ritel (`XL, YP, XC, PD, NI`).
+2. Pasukan ritel tercatat melakukan **Net Sell masif** (barang berpindah dari ritel ke bandar).
+3. Harga ditutup di puncak (*Close >= 95% - 100% of High of Day*).
+4. Harga closing masih nempel di area modal bandar (*Margin < +4%*).
+5. Likuiditas sehat (Turnover minimal Rp 5 Miliar).
+
+*Output:* Rekomendasi Grade A+ & A lengkap dengan **Area Masuk Pagi**, **TP1 (+2.5%)**, **TP2 (+5.0%)**, **Stop Loss**, dan arsip laporan di `reports/bsjp_confluence_YYYYMMDD.md`.
+
+---
+
+### 4. Sinyal Swing Multi-Day (`stockbit-swing`)
+
+Sinyal **Swing Confluence** (+7% s/d +15%) yang mengawinkan data akumulasi sepekan (Phase 1) dengan mikrostruktur hari pelatuk (Phase 3). Dilengkapi dengan teknologi **Targeted L2 Sniper Funnel**:
+```bash
+# Menjalankan screening 5 hari bursa (default):
+uv run stockbit-swing
+
+# Custom periode dan turnover:
+uv run stockbit-swing --days 5 --min-val 10000000000
+
+# Mode Super Cepat Offline (tanpa cek L2):
+uv run stockbit-swing --no-l2
+```
+
+**Alur Kerja Otomatis (Targeted L2 Sniper Funnel):**
+1. Mesin menyaring seluruh bursa mencari saham dengan **Smart Money Net Buy puluhan Miliar** selama 5 hari berturut-turut.
+2. Mesin mengekstrak **Top 10-15 saham akumulasi terbaik**.
+3. Jika data L2 hari Jumat untuk 10 saham tersebut belum ada di database, mesin **secara otomatis hanya menyedot L2 untuk 10 saham itu saja** (~30 detik, tanpa perlu menunggu scraping 7 jam!).
+4. Menghasilkan *Swing Trading Plan* dengan batas pengaman *Cut Loss* tepat di bawah modal rata-rata mingguan bandar (*5D Cost Basis*).
+*Arsip Laporan:* `reports/swing_confluence_YYYYMMDD.md`.
+
