@@ -368,5 +368,69 @@ def main():
         print(f"  • Net Distribusi: {net_sell_str}")
     print()
 
+    # SECTION 5: FULL DAY EOD BROKER SUMMARY (EXACT STOCKBIT REPLICA)
+    eod_brokers = defaultdict(lambda: {'b_lot': 0.0, 'b_val': 0.0, 's_lot': 0.0, 's_val': 0.0})
+    for t in ticks:
+        price = t['price']
+        lot = t['lot']
+        val = lot * 100 * price
+        bcode = t['buyer_code'].split()[0] if t['buyer_code'] else None
+        scode = t['seller_code'].split()[0] if t['seller_code'] else None
+        
+        if bcode:
+            eod_brokers[bcode]['b_lot'] += lot
+            eod_brokers[bcode]['b_val'] += val
+        if scode:
+            eod_brokers[scode]['s_lot'] += lot
+            eod_brokers[scode]['s_val'] += val
+            
+    net_buyers_eod = []
+    net_sellers_eod = []
+    
+    for b, d in eod_brokers.items():
+        net_val = d['b_val'] - d['s_val']
+        net_lot = d['b_lot'] - d['s_lot']
+        
+        b_avg = (d['b_val'] / (d['b_lot'] * 100)) if d['b_lot'] else 0
+        s_avg = (d['s_val'] / (d['s_lot'] * 100)) if d['s_lot'] else 0
+        
+        if net_val > 0 and net_lot > 0:
+            net_buyers_eod.append({
+                'broker': b, 'val': net_val, 'lot': net_lot, 'avg': b_avg
+            })
+        elif net_val < 0 and net_lot < 0:
+            net_sellers_eod.append({
+                'broker': b, 'val': abs(net_val), 'lot': abs(net_lot), 'avg': s_avg
+            })
+            
+    net_buyers_eod.sort(key=lambda x: x['val'], reverse=True)
+    net_sellers_eod.sort(key=lambda x: x['val'], reverse=True)
+    
+    def fmt_short(v):
+        if v >= 1e9: return f"{v/1e9:.1f}B"
+        if v >= 1e6: return f"{v/1e6:.1f}M"
+        if v >= 1e3: return f"{v/1e3:.1f}K"
+        return f"{v:,.0f}"
+
+    def fmt_lot_short(l):
+        if l >= 1e6: return f"{l/1e6:.1f}M"
+        if l >= 1e3: return f"{l/1e3:.0f}K"
+        return f"{l:,.0f}"
+
+    print("--------------------------------------------------")
+    print("🏆 [5] BROKER SUMMARY TOTAL 1 HARI (EOD STOCKBIT NET VIEW):")
+    print(f"{'BY':<4} {'B.val':<8} {'B.lot':<8} {'B.avg':<6} | {'SL':<4} {'S.val':<8} {'S.lot':<8} {'S.avg':<6}")
+    print("-" * 55)
+    
+    max_len = max(len(net_buyers_eod), len(net_sellers_eod))
+    for i in range(min(10, max_len)):
+        b = net_buyers_eod[i] if i < len(net_buyers_eod) else None
+        s = net_sellers_eod[i] if i < len(net_sellers_eod) else None
+        
+        b_str = f"{b['broker']:<4} {fmt_short(b['val']):<8} {fmt_lot_short(b['lot']):<8} {b['avg']:<6.0f}" if b else " " * 28
+        s_str = f"{s['broker']:<4} {fmt_short(s['val']):<8} {fmt_lot_short(s['lot']):<8} {s['avg']:<6.0f}" if s else ""
+        print(f"{b_str} | {s_str}")
+    print()
+
 if __name__ == "__main__":
     main()
