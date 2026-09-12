@@ -1,7 +1,7 @@
 """
-Stockbit High-Conviction BSJP Confluence Engine.
+Stockbit BPJU Confluence Engine.
 Fuses Market Microstructure, L2 Tick Flow, and Exodus Broker Footprints
-to generate high-winrate BSJP (Beli Sore Jual Pagi) signals for tomorrow.
+to generate heuristic BPJU (Beli Pagi Jual Untung) candidates for tomorrow.
 """
 
 from __future__ import annotations
@@ -12,15 +12,9 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from stockbit_ws.postgres import connect_database
-
-RETAIL_BROKERS = {"XL", "YP", "XC", "PD", "NI"}
-
-# Renowned institutional / smart money / market maker brokers in IDX
-SMART_MONEY_BROKERS = {
-    "AK", "BK", "ZP", "KZ", "RX", "YU", "IN", "MG", "CP", 
-    "LG", "KI", "SQ", "AZ", "GR", "EP", "XA", "YB", "OD", "BB", "DR", "SS", "FS", "AG"
-}
+from stockbit_ws.postgres import connect_database, initialize_schema
+from stockbit_ws.broker_groups import broker_group
+from stockbit_ws.sniper import round_to_idx_tick
 
 def format_rupiah(val: float) -> str:
     if abs(val) >= 1_000_000_000:
@@ -40,10 +34,31 @@ def run_bsjp_confluence(
     target_date: str,
     min_turnover_idr: float = 5_000_000_000,
     min_trades: int = 1_000,
-    max_premium_pct: float = 6.0,
+    max_premium_pct: float = 4.0,
+    trust_existing_l2: bool = False,
 ) -> list[dict[str, Any]]:
-    """Scan broker_l2_ticks for true smart-money accumulation and closing momentum."""
+    """Scan broker_l2_ticks for classified broker flow and closing momentum."""
+    try:
+        target_date = datetime.date.fromisoformat(target_date).isoformat()
+    except ValueError:
+        raise ValueError("Format tanggal harus YYYY-MM-DD") from None
     conn = connect_database()
+    initialize_schema(conn)
+    complete = conn.execute(
+        "SELECT 1 FROM stockbit_ws.broker_l2_ingestion WHERE date = %s AND symbol = '*'",
+        (target_date,),
+    ).fetchone()
+    if not complete and not trust_existing_l2:
+        conn.close()
+        return []
+    if trust_existing_l2 and not complete:
+        existing = conn.execute(
+            "SELECT 1 FROM stockbit_ws.broker_l2_ticks WHERE date = %s LIMIT 1",
+            (target_date,),
+        ).fetchone()
+        if not existing:
+            conn.close()
+            return []
     cur = conn.cursor()
 
     # 1. Fetch liquid candidates closing green near High of Day
@@ -142,9 +157,10 @@ def run_bsjp_confluence(
             b_avg = (d["b_val"] / (d["b_lot"] * 100)) if d["b_lot"] else 0
             s_avg = (d["s_val"] / (d["s_lot"] * 100)) if d["s_lot"] else 0
             
-            if bcode in RETAIL_BROKERS:
+            group = broker_group(bcode)
+            if group == "retail":
                 retail_net_val += n_val
-            else:
+            elif group == "smart":
                 smart_net_val += n_val
 
             net_list.append({
@@ -158,7 +174,10 @@ def run_bsjp_confluence(
             })
 
         net_list.sort(key=lambda x: x["net_val"], reverse=True)
-        top_buyers = [x for x in net_list if x["net_val"] > 0]
+        top_buyers = [
+            x for x in net_list
+            if x["net_val"] > 0 and broker_group(x["broker"]) == "smart"
+        ]
         top_sellers = [x for x in net_list if x["net_val"] < 0]
         top_sellers.sort(key=lambda x: x["net_val"])  # Most negative first
 
@@ -167,20 +186,15 @@ def run_bsjp_confluence(
 
         primary_buyer = top_buyers[0]
 
-        # FILTER 1: Primary Buyer CANNOT be pure retail!
-        if primary_buyer["broker"] in RETAIL_BROKERS:
-            continue
-
         # FILTER 2: Retail Must Be Net Sellers (Smart Money is taking their shares)
         if retail_net_val >= 0:
             continue
 
-        # FILTER 3: Top Buyer's Gross Average Cost vs Close Price
-        # Bandar hasn't taken profit if close is close to their cost basis
+        # FILTER 3: Top Buyer's gross average cost vs close price.
         top_b_avg = primary_buyer["buy_avg"]
         premium_pct = ((close_p - top_b_avg) / top_b_avg * 100.0) if top_b_avg else 0.0
         if premium_pct > max_premium_pct:
-            continue  # Already overbought / extended above bandar cost
+            continue  # Already extended above the broker average.
 
         # Late session check: did smart money dump at the close?
         late_top_buyer_net = late_brokers[primary_buyer["broker"]]["b_val"] - late_brokers[primary_buyer["broker"]]["s_val"]
@@ -198,7 +212,7 @@ def run_bsjp_confluence(
             score += 5.0
 
         # 2. Cost Basis Cushion (+15 max)
-        # The closer the close price is to bandar cost, the higher the score
+        # The closer the close price is to the broker average, the higher the score.
         if -1.0 <= premium_pct <= 1.5:
             score += 15.0
         elif 1.5 < premium_pct <= 3.5:
@@ -221,22 +235,22 @@ def run_bsjp_confluence(
             score += 5.0
 
         # Grade Assignment
+        score = min(100.0, score)
         if score >= 90.0:
             grade = "A+ (STRONG CONFLUENCE)"
-            win_rate = "85% - 90%"
         elif score >= 80.0:
-            grade = "A (HIGH PROBABILITY)"
-            win_rate = "75% - 85%"
+            grade = "A (STRONG HEURISTIC)"
         else:
             grade = "B+ (SOLID SPECULATIVE)"
-            win_rate = "68% - 75%"
 
         # Trading Plan formulation
-        entry_low = close_p
-        entry_high = round(close_p * 1.015)  # up to +1.5% at open
-        tp1 = round(close_p * 1.025)        # +2.5% morning scalp
-        tp2 = round(close_p * 1.050)        # +5.0% runner
-        sl = round(min(open_p, top_b_avg * 0.98))  # Below open or -2% of bandar avg
+        entry_low = round_to_idx_tick(close_p)
+        entry_high = round_to_idx_tick(close_p * 1.015)  # up to +1.5% at open
+        tp1 = round_to_idx_tick(close_p * 1.025)        # +2.5% morning scalp
+        tp2 = round_to_idx_tick(close_p * 1.050)        # +5.0% runner
+        sl = round_to_idx_tick(min(open_p, top_b_avg * 0.98))  # Below open or -2% of broker average.
+        risk = entry_low - sl
+        rr_ratio = (tp1 - entry_low) / risk if risk > 0 else 0.0
 
         gain_pct = ((close_p - open_p) / open_p * 100.0) if open_p else 0.0
 
@@ -252,7 +266,6 @@ def run_bsjp_confluence(
             "total_lot": total_lot,
             "score": score,
             "grade": grade,
-            "win_rate": win_rate,
             "primary_buyer": primary_buyer["broker"],
             "primary_buyer_val": primary_buyer["net_val"],
             "primary_buyer_lot": primary_buyer["net_lot"],
@@ -267,7 +280,7 @@ def run_bsjp_confluence(
                 "tp1": f"{int(tp1)} (+2.5%)",
                 "tp2": f"{int(tp2)} (+5.0%)",
                 "sl": f"{int(sl)} ({round((sl - close_p)/close_p*100, 1)}%)",
-                "rr_ratio": "1 : 2.2"
+                "rr_ratio": f"1 : {rr_ratio:.1f}"
             }
         })
 
@@ -277,22 +290,22 @@ def run_bsjp_confluence(
 
 
 def generate_report(picks: list[dict[str, Any]], target_date: str) -> str:
-    """Generate professional Markdown BSJP Confluence Report."""
+    """Generate a Markdown report of BPJU heuristic candidates."""
     now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     
     md = []
-    md.append(f"# 🚀 LAPORAN REKOMENDASI BSJP SUPER HIGH WIN-RATE")
+    md.append(f"# 🚀 LAPORAN KANDIDAT BPJU CONFLUENCE")
     md.append(f"**Tanggal Analisis:** `{target_date}` | **Waktu Rilis:** `{now_str}`")
     md.append(f"**Engine:** `Stockbit Exodus L2 Microstructure & Smart Money Confluence`\n")
     
     md.append("---")
     md.append("### 🎯 Executive Summary (Filosofi Sinyal):")
-    md.append("Sinyal BSJP ini dihasilkan melalui **5 Pilar Confluence Anti-Ritel Trap**:")
-    md.append("1. **Akumulasi Asli Smart Money**: Pembeli utama wajib broker institusi/asing, bukan ritel (XL, YP, XC).")
-    md.append("2. **Kapitulasi Ritel**: Ritel tercatat melakukan **Net Sell Masif** (barang berpindah dari ritel ke bandar).")
+    md.append("Kandidat BPJU ini dihasilkan melalui **5 Pilar Confluence** (heuristik, bukan probabilitas teruji):")
+    md.append("1. **Broker Terklasifikasi**: Pembeli utama harus ada dalam daftar broker smart-money terkonfigurasi.")
+    md.append("2. **Penjualan Kode Ritel**: Kode ritel terkonfigurasi tercatat melakukan **Net Sell**.")
     md.append("3. **Closing Urgency**: Harga ditutup kuat di atas 95% s/d 100% High of Day.")
-    md.append("4. **Cost Basis Advantage**: Harga closing belum lari jauh dari modal beli bandar (Margin < +4%).")
-    md.append("5. **Likuiditas Sehat**: Turnover harian minimal Rp 5 Miliar (aman untuk exit besok pagi).\n")
+    md.append("4. **Cost Basis Heuristic**: Harga closing belum lari jauh dari rata-rata pembelian broker tersebut (Margin < +4%).")
+    md.append("5. **Likuiditas Minimum**: Turnover tercatat minimal Rp 5 Miliar.\n")
 
     if not picks:
         md.append("⚠️ **Tidak ada saham yang memenuhi seluruh 5 Pilar Confluence ketat untuk tanggal ini.**")
@@ -305,9 +318,9 @@ def generate_report(picks: list[dict[str, Any]], target_date: str) -> str:
         md.append(f"### {i}. {p['symbol']} — {p['grade']} (Skor: {p['score']:.0f}/100)")
         md.append(f"- **Harga Closing:** `Rp {int(p['close']):,}` (`+{p['gain_pct']:.1f}%`) | **HOD Strength:** `{p['hod_pct']:.1f}%`")
         md.append(f"- **Total Turnover:** `{format_rupiah(p['total_val'])}` ({format_lot(p['total_lot'])} lot)")
-        md.append(f"- **Aktor Utama (Top Bandar):** **`{p['primary_buyer']}`** Net Buy `{format_rupiah(p['primary_buyer_val'])}` @ Avg `Rp {p['primary_buyer_avg']:.1f}`")
-        md.append(f"- **Margin terhadap Modal Bandar:** `{p['premium_pct']:+.1f}%` *(Sangat aman, bandar belum ambil untung!)*")
-        md.append(f"- **Aliran Dana:** Bandar Net **`+{format_rupiah(p['smart_net'])}`** ➔ Ritel Terbabat **`{format_rupiah(p['retail_net'])}`**")
+        md.append(f"- **Broker Smart-Money Utama (terklasifikasi):** **`{p['primary_buyer']}`** Net Buy `{format_rupiah(p['primary_buyer_val'])}` @ Avg `Rp {p['primary_buyer_avg']:.1f}`")
+        md.append(f"- **Margin terhadap Rata-rata Broker:** `{p['premium_pct']:+.1f}%` *(indikator jarak harga, bukan bukti posisi terbuka)*")
+        md.append(f"- **Aliran Dana Terklasifikasi:** Smart **`+{format_rupiah(p['smart_net'])}`** ➔ Kode Ritel **`{format_rupiah(p['retail_net'])}`**")
         md.append(f"- **Top 3 Pembeli:** {', '.join(p['top_buyers_summary'])}")
         md.append(f"- **Top 3 Penjual:** {', '.join(p['top_sellers_summary'])}")
         md.append(f"\n📋 **Rencana Trading Eksekusi Besok Pagi:**")
@@ -317,26 +330,33 @@ def generate_report(picks: list[dict[str, Any]], target_date: str) -> str:
         md.append("\n" + "-" * 50 + "\n")
 
     md.append("## 📊 TABEL RADAR SELURUH KANDIDAT LOLOS SCREENING CONFLUENCE\n")
-    md.append("| No | Saham | Close | Chg (%) | HOD (%) | Top Buyer | Net Val | Modal Bandar | Margin | Bandar Net | Ritel Net | Skor |")
+    md.append("| No | Saham | Close | Chg (%) | HOD (%) | Top Buyer | Net Val | Avg Broker | Margin | Smart Net | Ritel Net | Skor |")
     md.append("|:--:|:-----:|:-----:|:-------:|:-------:|:---------:|:-------:|:------------:|:------:|:----------:|:---------:|:----:|")
     
     for i, p in enumerate(picks, 1):
         md.append(f"| {i} | **{p['symbol']}** | {int(p['close']):,} | +{p['gain_pct']:.1f}% | {p['hod_pct']:.1f}% | {p['primary_buyer']} | {format_rupiah(p['primary_buyer_val'])} | {p['primary_buyer_avg']:.0f} | {p['premium_pct']:+.1f}% | +{format_rupiah(p['smart_net'])} | {format_rupiah(p['retail_net'])} | **{p['score']:.0f}** |")
 
-    md.append("\n\n---\n*Peringatan Risiko: Sinyal ini dihasilkan secara algoritmik dari data mikrostruktur bursa. Selalu patuhi batas toleransi Cut Loss maksimal -2% s/d -3% jika pasar bergerak melawan arah.*")
+    md.append("\n\n---\n*Peringatan Risiko: Kandidat ini bersifat heuristik dan menggunakan data yang tersedia saja. Verifikasi likuiditas, fraksi harga, dan risiko sebelum mengambil keputusan.*")
     return "\n".join(md)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Stockbit High-Conviction BSJP Confluence Engine")
+    parser = argparse.ArgumentParser(description="Stockbit BPJU Confluence Candidate Scanner")
     parser.add_argument("--date", type=str, help="YYYY-MM-DD", default=None)
     parser.add_argument("--min-val", type=float, default=5_000_000_000, help="Minimum turnover IDR (default: 5B)")
-    parser.add_argument("--max-prem", type=float, default=6.0, help="Maximum premium above bandar avg (default: 6%%)")
+    parser.add_argument("--max-prem", type=float, default=4.0, help="Maximum premium above broker average (default: 4%%)")
+    parser.add_argument(
+        "--trust-existing-l2", action="store_true",
+        help="Gunakan tick L2 lama pada tanggal target meski belum punya marker kelengkapan",
+    )
     args = parser.parse_args()
 
     conn = connect_database()
     if args.date:
-        target_date = args.date
+        try:
+            target_date = datetime.date.fromisoformat(args.date).isoformat()
+        except ValueError:
+            parser.error("--date harus berformat YYYY-MM-DD")
     else:
         # Default to latest date in broker_l2_ticks
         row = conn.execute("SELECT max(date) as d FROM stockbit_ws.broker_l2_ticks").fetchone()
@@ -347,10 +367,17 @@ def main():
         target_date = row["d"].isoformat()
     conn.close()
 
-    print(f"🔍 Menjalankan BSJP Confluence Scanner untuk tanggal {target_date}...")
+    print(f"🔍 Menjalankan BPJU Confluence Scanner untuk tanggal {target_date}...")
     print(f"   Filter: Min Turnover {format_rupiah(args.min_val)} | Max Premium {args.max_prem}%")
 
-    picks = run_bsjp_confluence(target_date, min_turnover_idr=args.min_val, max_premium_pct=args.max_prem)
+    if args.trust_existing_l2:
+        print("⚠️ Menggunakan L2 lama tanpa marker kelengkapan sesuai pilihan pengguna.")
+    picks = run_bsjp_confluence(
+        target_date,
+        min_turnover_idr=args.min_val,
+        max_premium_pct=args.max_prem,
+        trust_existing_l2=args.trust_existing_l2,
+    )
 
     report_md = generate_report(picks, target_date)
 
@@ -368,7 +395,7 @@ def main():
     for i, p in enumerate(picks[:5], 1):
         print(f"{i}. [{p['grade']}] {p['symbol']} (Close: {int(p['close']):,} | Skor: {p['score']:.0f}/100)")
         print(f"   Top Buyer: {p['primary_buyer']} Net +{format_rupiah(p['primary_buyer_val'])} @ Avg {p['primary_buyer_avg']:.0f} (Margin: {p['premium_pct']:+.1f}%)")
-        print(f"   Aliran: Bandar Net +{format_rupiah(p['smart_net'])} vs Ritel Net {format_rupiah(p['retail_net'])}")
+        print(f"   Aliran terklasifikasi: Smart Net +{format_rupiah(p['smart_net'])} vs Ritel Net {format_rupiah(p['retail_net'])}")
         print(f"   Plan: Beli {p['plan']['entry']} | TP1: {p['plan']['tp1']} | TP2: {p['plan']['tp2']} | SL: {p['plan']['sl']}")
         print("-" * 60)
 

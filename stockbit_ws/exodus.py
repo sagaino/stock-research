@@ -67,7 +67,8 @@ def fetch_top_brokers(
         to={date}
         market_type=MARKET_TYPE_REGULER
     
-    Returns: list of broker dicts dari response["data"]["list"]
+    Returns: broker rows sorted locally by ``total_value`` descending.  The
+    endpoint may ignore its sort/limit parameters.
     Raises: httpx.HTTPStatusError pada 4xx/5xx
     """
     resp = client.get(
@@ -82,7 +83,20 @@ def fetch_top_brokers(
     )
     resp.raise_for_status()
     data = resp.json()
-    return data.get("data", {}).get("list", [])
+    envelope = data.get("data") or {}
+    date_meta = envelope.get("date") if isinstance(envelope.get("date"), dict) else {}
+    reported_from = envelope.get("from") or date_meta.get("from")
+    reported_to = envelope.get("to") or date_meta.get("to")
+    if reported_from and str(reported_from)[:10] != date.isoformat():
+        raise ValueError("Top broker API returned a different start date")
+    if reported_to and str(reported_to)[:10] != date.isoformat():
+        raise ValueError("Top broker API returned a different end date")
+    brokers = envelope.get("list") or []
+    return sorted(
+        brokers,
+        key=lambda broker: _safe_numeric(broker.get("total_value")) or 0.0,
+        reverse=True,
+    )
 
 
 def fetch_broker_activity(
@@ -91,43 +105,71 @@ def fetch_broker_activity(
     period: str = "RT_PERIOD_LAST_1_DAY",
     transaction_type: str = "TRANSACTION_TYPE_NET",
     limit: int = 50,
+    *,
+    target_date: datetime.date | None = None,
 ) -> list[dict[str, Any]]:
     """Fetch aktivitas satu broker (daftar saham yang ditransaksikan).
     
     API: GET /order-trade/broker/activity
     
-    Returns: list of stock activity dicts dari response["data"]["list"]
+    ``target_date`` uses the API's explicit ``from``/``to`` window.  The
+    endpoint does not provide a reliable historical date when only the
+    relative ``period`` preset is sent, so callers must pass the target date
+    for an EOD audit.
+
+    Returns: normalized list from ``brokers_buy``/``brokers_sell``.  Each row
+    carries an internal ``_side`` marker because both API lists use positive
+    values.
     """
     all_items = []
     page = 1
     while True:
+        params = {
+            "broker_code": broker_code,
+            "limit": limit,
+            "page": page,
+            "transaction_type": transaction_type,
+            "market_board": "MARKET_TYPE_REGULER",
+            "investor_type": "INVESTOR_TYPE_ALL",
+        }
+        if target_date is None:
+            params["period"] = period
+        else:
+            params["from"] = target_date.isoformat()
+            params["to"] = target_date.isoformat()
+
         resp = client.get(
             "/order-trade/broker/activity",
-            params={
-                "broker_code": broker_code,
-                "limit": limit,
-                "page": page,
-                "transaction_type": transaction_type,
-                "market_board": "MARKET_TYPE_REGULER",
-                "investor_type": "INVESTOR_TYPE_ALL",
-                "period": period,
-            },
+            params=params,
         )
         resp.raise_for_status()
         data = resp.json()
+        envelope = data.get("data") or {}
+
+        # Refuse to persist a response that advertises a different window.
+        # Older API responses omit these fields, in which case the explicit
+        # from/to request remains the only available date contract.
+        if target_date is not None:
+            reported_from = envelope.get("from")
+            reported_to = envelope.get("to")
+            if reported_from and str(reported_from)[:10] != target_date.isoformat():
+                raise ValueError("Broker activity API returned a different start date")
+            if reported_to and str(reported_to)[:10] != target_date.isoformat():
+                raise ValueError("Broker activity API returned a different end date")
         
-        transaction_data = data.get("data", {}).get("broker_activity_transaction", {})
-        buyers = transaction_data.get("brokers_buy", [])
-        sellers = transaction_data.get("brokers_sell", [])
-        
-        items = buyers + sellers
+        transaction_data = envelope.get("broker_activity_transaction") or {}
+        buyers = transaction_data.get("brokers_buy") or []
+        sellers = transaction_data.get("brokers_sell") or []
+
+        # The API reports ``value`` and ``lot`` as positive numbers on both
+        # sides. Keep the container side attached so storage can derive a
+        # signed net value instead of treating every seller as a buyer.
+        items = [dict(item, _side="buy") for item in buyers]
+        items.extend(dict(item, _side="sell") for item in sellers)
         if not items:
             break
         all_items.extend(items)
-        # Safety cap: max 10 pages (500 items) per broker per day
         page += 1
-        if page > 10:
-            break
         time.sleep(REQUEST_DELAY_SECONDS)
     return all_items
 
@@ -189,40 +231,113 @@ def store_broker_activity(
     Parsing response structure:
     Setiap item di activities memiliki:
       - stock_code: "DSSA"
-      - net_val: "-15343500"
-      - buy_val / sell_val (mungkin nested atau flat)
-      - buy_lot / sell_lot
-      - buy_avg / sell_avg (jika tersedia)
+      - ``value``, ``lot``, ``avg_price`` on the API's buy/sell lists
+      - ``net_val`` / ``buy_val`` / ``sell_val`` for already-normalized data
+
+    Exodus encodes sell ``value``/``lot`` as negative numbers.  Database
+    ``buy_*``/``sell_*`` columns store positive magnitudes; ``net_value`` is
+    derived as buy minus sell.
     
     Returns: jumlah row yang diproses.
     """
     if not activities:
         return 0
-    rows = []
+    aggregated = {}
     for a in activities:
         symbol = a.get("stock_code") or a.get("symbol")
         if not symbol:
             continue
-        
-        net_val = _safe_numeric(a.get("value"))
-        lot = _safe_numeric(a.get("lot"))
-        avg_price = _safe_numeric(a.get("avg_price"))
-        
-        is_buy = net_val is not None and net_val > 0
-        
+
+        def number(*keys):
+            for key in keys:
+                if key in a:
+                    value = _safe_numeric(a.get(key))
+                    if value is not None:
+                        return value
+            return None
+
+        side = str(a.get("_side") or a.get("type") or "").lower()
+        raw_value = number("value")
+        net_val = number("net_value", "net_val")
+        buy_val = number("buy_value", "buy_val")
+        sell_val = number("sell_value", "sell_val")
+        if buy_val is not None:
+            buy_val = abs(buy_val)
+        if sell_val is not None:
+            sell_val = abs(sell_val)
+        if raw_value is not None and not (buy_val is not None or sell_val is not None):
+            magnitude = abs(raw_value)
+            if "sell" in side:
+                sell_val, net_val = magnitude, -magnitude
+            elif "buy" in side:
+                buy_val, net_val = magnitude, magnitude
+            else:
+                net_val = raw_value
+        if net_val is None and (buy_val is not None or sell_val is not None):
+            net_val = (buy_val or 0) - (sell_val or 0)
+        if buy_val is None:
+            buy_val = net_val if net_val is not None and net_val > 0 else 0
+        if sell_val is None:
+            sell_val = abs(net_val) if net_val is not None and net_val < 0 else 0
+
+        lot = number("lot", "net_lot")
+        buy_lot = number("buy_lot")
+        sell_lot = number("sell_lot")
+        if buy_lot is not None:
+            buy_lot = abs(buy_lot)
+        if sell_lot is not None:
+            sell_lot = abs(sell_lot)
+        if buy_lot is None and "buy" in side:
+            buy_lot = abs(lot or 0)
+        if sell_lot is None and "sell" in side:
+            sell_lot = abs(lot or 0)
+        if buy_lot is None and net_val is not None and net_val > 0:
+            buy_lot = abs(lot or 0)
+        if sell_lot is None and net_val is not None and net_val < 0:
+            sell_lot = abs(lot or 0)
+        avg_price = number("avg_price", "buy_avg_price", "buy_avg")
+        sell_avg_price = number("sell_avg_price", "sell_avg")
+
+        item = aggregated.setdefault(symbol.upper(), {
+            "net_val": 0.0, "buy_val": 0.0, "sell_val": 0.0,
+            "buy_lot": 0.0, "sell_lot": 0.0,
+            "buy_avg_weight": 0.0, "buy_avg_value": 0.0,
+            "sell_avg_weight": 0.0, "sell_avg_value": 0.0,
+        })
+        item["net_val"] += net_val or 0
+        item["buy_val"] += buy_val or 0
+        item["sell_val"] += sell_val or 0
+        item["buy_lot"] += buy_lot or 0
+        item["sell_lot"] += sell_lot or 0
+        if avg_price is not None and buy_val:
+            weight = buy_lot or buy_val
+            item["buy_avg_weight"] += weight
+            item["buy_avg_value"] += avg_price * weight
+        if sell_avg_price is None and "sell" in side:
+            sell_avg_price = avg_price
+        if sell_avg_price is not None and sell_val:
+            weight = sell_lot or sell_val
+            item["sell_avg_weight"] += weight
+            item["sell_avg_value"] += sell_avg_price * weight
+
+    rows = []
+    for symbol, item in aggregated.items():
+        buy_val = item["buy_val"]
+        sell_val = item["sell_val"]
+        buy_lot = item["buy_lot"]
+        sell_lot = item["sell_lot"]
+        buy_avg = (
+            item["buy_avg_value"] / item["buy_avg_weight"]
+            if item["buy_avg_weight"] else (buy_val / (buy_lot * 100) if buy_lot else None)
+        )
+        sell_avg = (
+            item["sell_avg_value"] / item["sell_avg_weight"]
+            if item["sell_avg_weight"] else (sell_val / (sell_lot * 100) if sell_lot else None)
+        )
+        net_val = buy_val - sell_val if buy_val or sell_val else item["net_val"]
         rows.append((
-            date,
-            broker_code,
-            symbol.upper(),
-            net_val,
-            net_val if is_buy else 0,
-            abs(net_val) if not is_buy and net_val is not None else 0,
-            lot if is_buy else 0,
-            abs(lot) if not is_buy and lot is not None else 0,
-            avg_price if is_buy else None,
-            avg_price if not is_buy else None,
-            None,
-            None,
+            date, broker_code, symbol, net_val, buy_val, sell_val,
+            buy_lot, sell_lot, buy_avg, sell_avg, None, None,
         ))
     if not rows:
         return 0
@@ -280,7 +395,7 @@ def run_ingestion(
     6. Return summary statistics
     
     Args:
-        date: Tanggal target (default: hari ini jika sebelum 16:15, kemarin jika sudah lewat)
+        date: Tanggal target (default: kemarin sebelum 16:15 WIB, hari ini sesudahnya)
         top_n_brokers: Jumlah top broker yang akan di-drill-down activity-nya
         env_file: Path ke file .env
     
@@ -299,6 +414,7 @@ def run_ingestion(
         "brokers_stored": 0,
         "activities_stored": 0,
         "brokers_processed": 0,
+        "eod_complete": False,
         "errors": [],
     }
     
@@ -323,7 +439,7 @@ def run_ingestion(
             time.sleep(REQUEST_DELAY_SECONDS)
             try:
                 print(f"📡 [{i}/{len(top_codes)}] Fetching activity broker {code}...")
-                activities = fetch_broker_activity(client, code)
+                activities = fetch_broker_activity(client, code, target_date=date)
                 count = store_broker_activity(conn, date, code, activities)
                 stats["activities_stored"] += count
                 stats["brokers_processed"] += 1
@@ -333,6 +449,22 @@ def run_ingestion(
                 stats["errors"].append(error_msg)
                 print(f"   ⚠️  {error_msg}")
                 continue
+
+        if len(top_codes) == top_n_brokers and not stats["errors"] and stats["brokers_processed"] == len(top_codes):
+            conn.execute(
+                """INSERT INTO stockbit_ws.broker_eod_ingestion
+                   (date, top_n, brokers_requested, brokers_processed, activities_stored)
+                   VALUES (%s, %s, %s, %s, %s)
+                   ON CONFLICT (date) DO UPDATE SET
+                     top_n = EXCLUDED.top_n,
+                     brokers_requested = EXCLUDED.brokers_requested,
+                     brokers_processed = EXCLUDED.brokers_processed,
+                     activities_stored = EXCLUDED.activities_stored,
+                     completed_at = now()""",
+                (date, top_n_brokers, len(top_codes), stats["brokers_processed"], stats["activities_stored"]),
+            )
+            stats["eod_complete"] = True
+            print(f"✅ EOD {date.isoformat()} ditandai lengkap ({len(top_codes)} broker).")
         
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:

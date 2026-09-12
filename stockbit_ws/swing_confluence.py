@@ -1,7 +1,7 @@
 """
 Stockbit Multi-Day Swing Confluence Engine (Phase 1 + Phase 3 Fusion).
-Bridges 5-Day Macro Broker Accumulation with Intraday Day-T Breakout Triggers
-to identify high-probability institutional swing setups (+7% to +20% targets).
+Bridges multi-day broker accumulation with intraday Day-T breakout triggers
+to identify heuristic broker-flow swing candidates (+7% to +20% targets).
 """
 
 from __future__ import annotations
@@ -12,9 +12,12 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
-from stockbit_ws.postgres import connect_database
+from stockbit_ws.postgres import connect_database, initialize_schema
+from stockbit_ws.broker_groups import broker_group
+from stockbit_ws.sniper import round_to_idx_tick
 
-RETAIL_BROKERS = {"XL", "YP", "XC", "PD", "NI"}
+DEFAULT_EOD_TOP_N = 20
+MAX_EOD_CALENDAR_SCAN_DAYS = 31
 
 def format_rupiah(val: float) -> str:
     if abs(val) >= 1_000_000_000:
@@ -36,20 +39,80 @@ def run_swing_confluence(
     min_total_turnover: float = 10_000_000_000, # Min 10B total over lookback
     max_margin_pct: float = 6.0,
     auto_fetch_l2: bool = True,
+    auto_fetch_eod: bool = True,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Execute Multi-Day Accumulation + Day-T Microstructure Confluence."""
+    """Execute multi-day accumulation + Day-T microstructure confluence."""
+    try:
+        target_date = datetime.date.fromisoformat(target_date).isoformat()
+    except ValueError:
+        raise ValueError("Format tanggal harus YYYY-MM-DD") from None
     conn = connect_database()
+    initialize_schema(conn)
     cur = conn.cursor()
 
-    # 1. Resolve trading dates available up to target_date
-    cur.execute("""
-        SELECT DISTINCT date 
-        FROM stockbit_ws.broker_stock_activity
-        WHERE date <= %s
-        ORDER BY date DESC
-        LIMIT %s
-    """, (target_date, lookback_days))
-    date_rows = cur.fetchall()
+    # 1. Ensure the requested EOD lookback has complete ingestion markers.
+    #    Missing weekdays are probed through Exodus; weekends/holidays simply
+    #    return no top-broker rows and are skipped.
+    if auto_fetch_eod:
+        from stockbit_ws.exodus import run_ingestion
+
+        complete_dates = set(
+            row["date"].isoformat()
+            for row in cur.execute(
+                """SELECT date FROM stockbit_ws.broker_eod_ingestion
+                   WHERE date <= %s AND top_n >= %s
+                     AND brokers_requested >= %s
+                     AND brokers_processed >= brokers_requested
+                   ORDER BY date DESC LIMIT %s""",
+                (target_date, DEFAULT_EOD_TOP_N, DEFAULT_EOD_TOP_N, lookback_days),
+            ).fetchall()
+        )
+        cursor_date = datetime.date.fromisoformat(target_date)
+        target_needs_probe = cursor_date.weekday() < 5 and target_date not in complete_dates
+        scanned_days = 0
+        while (len(complete_dates) < lookback_days or target_needs_probe) and scanned_days < MAX_EOD_CALENDAR_SCAN_DAYS:
+            date_str = cursor_date.isoformat()
+            if cursor_date.weekday() < 5 and date_str not in complete_dates:
+                print(f"📡 [EOD] Memastikan aktivitas broker untuk {date_str}...")
+                try:
+                    run_ingestion(date=cursor_date, top_n_brokers=DEFAULT_EOD_TOP_N)
+                except Exception as exc:
+                    print(f"⚠️ EOD {date_str} gagal: {exc}")
+                    break
+                marker = cur.execute(
+                    """SELECT 1 FROM stockbit_ws.broker_eod_ingestion
+                       WHERE date = %s AND top_n >= %s
+                         AND brokers_requested >= %s
+                         AND brokers_processed >= brokers_requested""",
+                    (date_str, DEFAULT_EOD_TOP_N, DEFAULT_EOD_TOP_N),
+                ).fetchone()
+                if marker:
+                    complete_dates.add(date_str)
+                if date_str == target_date:
+                    target_needs_probe = not marker
+            cursor_date -= datetime.timedelta(days=1)
+            scanned_days += 1
+        date_rows = cur.execute(
+            """SELECT date FROM stockbit_ws.broker_eod_ingestion
+               WHERE date <= %s AND top_n >= %s
+                 AND brokers_requested >= %s
+                 AND brokers_processed >= brokers_requested
+               ORDER BY date DESC LIMIT %s""",
+            (target_date, DEFAULT_EOD_TOP_N, DEFAULT_EOD_TOP_N, lookback_days),
+        ).fetchall()
+        if target_needs_probe:
+            print(f"⚠️ EOD target {target_date} belum lengkap; screening dihentikan.")
+            conn.close()
+            return [], []
+    else:
+        # Offline mode keeps the legacy behavior and uses whatever rows exist.
+        date_rows = cur.execute("""
+            SELECT DISTINCT date
+            FROM stockbit_ws.broker_stock_activity
+            WHERE date <= %s
+            ORDER BY date DESC
+            LIMIT %s
+        """, (target_date, lookback_days)).fetchall()
     
     if not date_rows:
         conn.close()
@@ -57,6 +120,9 @@ def run_swing_confluence(
 
     resolved_dates = sorted([r["date"].isoformat() for r in date_rows])
     num_days = len(resolved_dates)
+    if num_days < 2:
+        conn.close()
+        return [], resolved_dates
 
     # 2. Query multi-day accumulation per symbol from broker_stock_activity
     cur.execute("""
@@ -84,11 +150,12 @@ def run_swing_confluence(
         "net_val": 0.0, "buy_val": 0.0, "sell_val": 0.0,
         "buy_lot": 0.0, "sell_lot": 0.0, "active_days": set()
     }))
+    retail_by_day = defaultdict(lambda: defaultdict(float))
 
     for r in activity_rows:
         sym = r["symbol"]
         b = r["broker_code"]
-        d = r["date"]
+        d = r["date"].isoformat()
         net_v = float(r["net_value"] or 0)
         buy_v = float(r["buy_value"] or 0)
         sell_v = float(r["sell_value"] or 0)
@@ -100,7 +167,10 @@ def run_swing_confluence(
         sym_brokers[sym][b]["sell_val"] += sell_v
         sym_brokers[sym][b]["buy_lot"] += buy_l
         sym_brokers[sym][b]["sell_lot"] += sell_l
-        if net_v > 0:
+        group = broker_group(b)
+        if group == "retail":
+            retail_by_day[sym][d] += net_v
+        if net_v > 0 and group == "smart":
             sym_brokers[sym][b]["active_days"].add(d)
 
     # 3. For each symbol, calculate Macro Accumulation metrics
@@ -118,9 +188,10 @@ def run_swing_confluence(
 
         broker_rankings = []
         for bcode, d in brokers.items():
-            if bcode in RETAIL_BROKERS:
+            group = broker_group(bcode)
+            if group == "retail":
                 retail_net += d["net_val"]
-            else:
+            elif group == "smart":
                 smart_net += d["net_val"]
 
             avg_buy = (d["buy_val"] / (d["buy_lot"] * 100)) if d["buy_lot"] else 0.0
@@ -134,14 +205,21 @@ def run_swing_confluence(
             })
 
         broker_rankings.sort(key=lambda x: x["net_val"], reverse=True)
-        top_buyer = broker_rankings[0]
-
-        # Elimination 1: Top buyer cannot be retail
-        if top_buyer["broker"] in RETAIL_BROKERS:
+        smart_rankings = [
+            b for b in broker_rankings
+            if broker_group(b["broker"]) == "smart" and b["net_val"] > 0
+        ]
+        if not smart_rankings:
+            continue
+        top_buyer = smart_rankings[0]
+        # Moderate persistence: allow at most one inactive day in the lookback.
+        if top_buyer["active_days"] < max(2, num_days - 1):
             continue
 
-        # Elimination 2: Retail must be net selling over the period
-        if retail_net >= 0:
+        # Retail must sell on at least three of five days and remain net-sell
+        # over the period (scaled down for shorter lookbacks).
+        retail_sell_days = sum(retail_by_day[sym][d] < 0 for d in resolved_dates)
+        if retail_net >= 0 or retail_sell_days < max(2, num_days - 2):
             continue
 
         # Elimination 3: Smart money must be net buying overall
@@ -153,30 +231,54 @@ def run_swing_confluence(
             "smart_net": smart_net,
             "retail_net": retail_net,
             "top_buyer": top_buyer,
-            "all_buyers": [b for b in broker_rankings if b["net_val"] > 0][:3],
-            "all_sellers": [b for b in broker_rankings if b["net_val"] < 0][-3:],
+            "all_buyers": smart_rankings[:3],
+            "all_sellers": sorted(
+                (b for b in broker_rankings if b["net_val"] < 0),
+                key=lambda b: b["net_val"],
+            )[:3],
         }
 
-    # 3B. Targeted L2 Auto-Fetch for Top Candidates (HANYA AMBIL 10-15 SAHAM TERPILIH)
-    top_candidate_syms = sorted(macro_candidates.keys(), key=lambda s: macro_candidates[s]["smart_net"], reverse=True)[:15]
-    
-    if auto_fetch_l2 and top_candidate_syms:
-        cur.execute("""
-            SELECT DISTINCT symbol 
-            FROM stockbit_ws.broker_l2_ticks 
-            WHERE date = %s AND symbol = ANY(%s)
-        """, (target_date, top_candidate_syms))
-        existing_l2 = {r["symbol"] for r in cur.fetchall()}
-        missing_l2 = [s for s in top_candidate_syms if s not in existing_l2]
+    # 3B. Targeted L2 Auto-Fetch for Top Candidates (up to 25 symbols)
+    top_candidate_syms = sorted(
+        macro_candidates,
+        key=lambda s: macro_candidates[s]["smart_net"],
+        reverse=True,
+    )[:25]
+    if not top_candidate_syms:
+        conn.close()
+        return [], resolved_dates
 
+    cur.execute("""
+        SELECT symbol
+        FROM stockbit_ws.broker_l2_ingestion
+        WHERE date = %s AND (symbol = '*' OR symbol = ANY(%s))
+    """, (target_date, top_candidate_syms))
+    completed_l2 = {r["symbol"] for r in cur.fetchall()}
+    wildcard_complete = "*" in completed_l2
+    ready_l2 = set(top_candidate_syms) if wildcard_complete else {
+        s for s in top_candidate_syms if s in completed_l2
+    }
+
+    if auto_fetch_l2 and top_candidate_syms and not wildcard_complete:
+        missing_l2 = [s for s in top_candidate_syms if s not in ready_l2]
         if missing_l2:
-            print(f"\n🎯 [TARGETED L2 SNIPER] Ditemukan {len(missing_l2)} saham top akumulasi 5D yang belum memiliki data L2 di {target_date}.")
-            print(f"⚡ Menyedot data L2 khusus untuk: {', '.join(missing_l2)} (Hanya ~30 detik, bukan 7 jam!)...")
-            try:
-                from stockbit_ws.exodus_l2 import run_ingestion
-                run_ingestion(target_date, symbols=missing_l2)
-            except Exception as e:
-                print(f"⚠️ Gagal menarik L2 otomatis: {e}. Melanjutkan analisis...")
+            print(f"\n🎯 [TARGETED L2 SNIPER] {len(missing_l2)} kandidat belum memiliki scrape L2 lengkap pada {target_date}.")
+            print(f"⚡ Menyedot satu per satu: {', '.join(missing_l2)}...")
+            from stockbit_ws.exodus_l2 import run_ingestion
+            for symbol in missing_l2:
+                try:
+                    fetched = run_ingestion(target_date, symbols=[symbol])
+                    if fetched is None:
+                        break
+                    ready_l2.add(symbol)
+                except Exception as e:
+                    print(f"⚠️ L2 {symbol} gagal: {e}")
+
+    # --no-l2 means no network fetch, not that an L2-dependent strategy can
+    # run without a completed L2 day already present in the database.
+    if not ready_l2:
+        conn.close()
+        return [], resolved_dates
 
     # 4. Cross-reference with Day-T (Latest Day) Microstructure in broker_l2_ticks
     cur.execute("""
@@ -194,7 +296,7 @@ def run_swing_confluence(
         WHERE date = %s
           AND symbol = ANY(%s)
         GROUP BY symbol
-    """, (target_date, list(macro_candidates.keys())))
+    """, (target_date, list(ready_l2)))
     day_ticks = cur.fetchall()
 
     swing_picks = []
@@ -210,29 +312,31 @@ def run_swing_confluence(
         haka_15 = float(dt["haka_15"] or 0)
         haki_15 = float(dt["haki_15"] or 0)
 
-        # Microstructure checks: Day T must be resilient / not a crash
+        # Microstructure checks: Day T must be resilient and show a closing push.
         if close_p <= 0 or high_p <= 0:
             continue
 
         hod_pct = (close_p / high_p * 100.0) if high_p else 0.0
         if hod_pct < 94.0:
             continue  # Must not close at day's low
-
-        # Cost Basis Cushion: Compare close_p to Top Bandar's Multi-Day Cost Basis
-        top_buyer = macro["top_buyer"]
-        bandar_avg = top_buyer["avg_buy"]
-        if not bandar_avg:
+        if haka_15 <= haki_15:
             continue
 
-        margin_pct = ((close_p - bandar_avg) / bandar_avg * 100.0)
-        if margin_pct > max_margin_pct:
-            continue  # Already overextended above 5-day bandar cost
+        # Cost Basis Cushion: compare close to the top broker's period average
+        top_buyer = macro["top_buyer"]
+        broker_avg = top_buyer["avg_buy"]
+        if not broker_avg:
+            continue
 
-        # SCORING ALGORITHM FOR SWING CONFLUENCE (0 - 100+)
+        margin_pct = ((close_p - broker_avg) / broker_avg * 100.0)
+        if margin_pct > max_margin_pct:
+            continue  # Already overextended above the period average
+
+        # SCORING ALGORITHM FOR SWING CONFLUENCE (0 - 100)
         score = 60.0
 
         # 1. Persistence Bonus (+15 max)
-        # Did bandar buy on multiple days?
+        # Did the top broker buy on multiple days?
         active_days = top_buyer["active_days"]
         if active_days >= max(2, int(num_days * 0.7)):
             score += 15.0
@@ -243,7 +347,7 @@ def run_swing_confluence(
 
         # 2. Margin Safety (+15 max)
         if -2.0 <= margin_pct <= 2.0:
-            score += 15.0  # Perfect entry right at bandar cost!
+            score += 15.0  # Entry is close to the broker average.
         elif 2.0 < margin_pct <= 4.0:
             score += 10.0
         else:
@@ -267,22 +371,24 @@ def run_swing_confluence(
             score += 3.0
 
         # Grade
+        score = min(100.0, score)
         if score >= 95.0:
-            grade = "S (INSTITUTIONAL SWING BREAKOUT)"
-            win_rate = "88% - 94%"
+            grade = "S (STRONG HEURISTIC BREAKOUT)"
         elif score >= 85.0:
-            grade = "A+ (STRONG MULTI-DAY ACCUMULATION)"
-            win_rate = "80% - 88%"
+            grade = "A+ (STRONG HEURISTIC ACCUMULATION)"
         else:
-            grade = "A (SOLID SWING POSITION)"
-            win_rate = "72% - 80%"
+            grade = "A (SOLID HEURISTIC SETUP)"
 
         # Swing Trading Plan Formulation
-        entry_low = round(bandar_avg * 0.99)
-        entry_high = round(close_p * 1.01)
-        tp1 = round(close_p * 1.07)  # +7% Swing Target 1
-        tp2 = round(close_p * 1.15)  # +15% Swing Target 2
-        sl = round(bandar_avg * 0.975)  # Cut loss 2.5% below bandar average cost
+        entry_low = round_to_idx_tick(broker_avg * 0.99)
+        entry_high = round_to_idx_tick(close_p * 1.01)
+        if entry_high < entry_low:
+            entry_low, entry_high = entry_high, entry_low
+        tp1 = round_to_idx_tick(close_p * 1.07)  # +7% Swing Target 1
+        tp2 = round_to_idx_tick(close_p * 1.15)  # +15% Swing Target 2
+        sl = round_to_idx_tick(broker_avg * 0.975)  # Cut loss 2.5% below broker average cost
+        risk = entry_low - sl
+        rr_ratio = (tp1 - entry_low) / risk if risk > 0 else 0.0
 
         day_gain = ((close_p - open_p) / open_p * 100.0) if open_p else 0.0
 
@@ -300,19 +406,18 @@ def run_swing_confluence(
             "retail_net": macro["retail_net"],
             "top_buyer": top_buyer["broker"],
             "top_buyer_net": top_buyer["net_val"],
-            "top_buyer_avg": bandar_avg,
+            "top_buyer_avg": broker_avg,
             "active_days": active_days,
             "num_days": num_days,
             "margin_pct": margin_pct,
             "score": score,
             "grade": grade,
-            "win_rate": win_rate,
             "plan": {
                 "entry": f"{int(entry_low)} - {int(entry_high)}",
                 "tp1": f"{int(tp1)} (+7.0%)",
                 "tp2": f"{int(tp2)} (+15.0%)",
                 "sl": f"{int(sl)} ({round((sl - close_p)/close_p*100, 1)}%)",
-                "rr_ratio": "1 : 3.5"
+                "rr_ratio": f"1 : {rr_ratio:.1f}"
             }
         })
 
@@ -329,30 +434,30 @@ def generate_swing_report(picks: list[dict[str, Any]], target_date: str, dates: 
     md = []
     md.append(f"# 🌊 LAPORAN SWING CONFLUENCE MULTI-DAY (PHASE 1 + PHASE 3)")
     md.append(f"**Rentang Analisis:** `{date_range_str}` | **Tanggal Rilis:** `{now_str}`")
-    md.append(f"**Engine:** `Stockbit Macro-Micro Institutional Confluence (Multi-Day Accumulation + Breakout Trigger)`\n")
+    md.append(f"**Engine:** `Stockbit Macro-Micro Broker-Code Confluence (Multi-Day Accumulation + Breakout Trigger)`\n")
     
     md.append("---")
     md.append("### 🎯 Filosofi Strategi Swing Confluence:")
-    md.append("Berbeda dengan sinyal harian (scalping), strategi **Swing Confluence** melacak jejak akumulasi diam-diam bandar selama seminggu penuh:")
-    md.append("1. **Akumulasi Persisten Multi-Day**: Broker institusi membuktikan komitmen beli di minimal 2 s/d 5 hari berturut-turut.")
-    md.append("2. **Kapitulasi Ritel Mingguan**: Pasukan ritel tercatat melakukan **Net Sell Beruntun** sepanjang pekan.")
-    md.append("3. **Bantalan Modal Mingguan (Bandar 5D Cost Basis)**: Harga beli Anda masih di area modal rata-rata bandar selama seminggu terakhir.")
+    md.append("Berbeda dengan sinyal harian (scalping), strategi **Swing Confluence** menggabungkan akumulasi broker terklasifikasi pada beberapa hari yang tersedia:")
+    md.append("1. **Akumulasi Persisten Multi-Day**: Broker smart-money terklasifikasi net-buy pada mayoritas hari analisis.")
+    md.append("2. **Penjualan Kode Ritel Harian**: Kode ritel terklasifikasi net-sell pada mayoritas hari analisis dan tetap net-sell secara total.")
+    md.append("3. **Bantalan Harga Broker**: Harga penutupan masih dekat dengan rata-rata pembelian broker utama selama periode.")
     md.append("4. **Hari Pelatuk (Day-T Trigger)**: Di hari terakhir, mikrostruktur L2 membuktikan adanya dorongan penutupan (*Closing Push*) yang menandai awal fase *Markup*.\n")
 
     if not picks:
         md.append("⚠️ **Tidak ada saham yang memenuhi kriteria ketat Swing Multi-Day untuk periode ini.**")
         return "\n".join(md)
 
-    md.append(f"## 🏆 TOP {min(5, len(picks))} SAHAM INSTITUTIONAL SWING SETUP\n")
+    md.append(f"## 🏆 TOP {min(5, len(picks))} SAHAM SWING SETUP TERKLASIFIKASI\n")
 
     for i, p in enumerate(picks[:5], 1):
         md.append(f"### {i}. {p['symbol']} — {p['grade']} (Skor: {p['score']:.0f}/100)")
         md.append(f"- **Harga Closing:** `Rp {int(p['close']):,}` (`+{p['day_gain']:.1f}%`) | **HOD Strength:** `{p['hod_pct']:.1f}%`")
         md.append(f"- **Turnover Periode ({p['num_days']} Hari):** `{format_rupiah(p['total_turnover'])}` (Hari Ini: `{format_rupiah(p['day_val'])}`)")
-        md.append(f"- **Akumulator Utama:** **`{p['top_buyer']}`** Net Buy `{format_rupiah(p['top_buyer_net'])}` *(Aktif beli di {p['active_days']} dari {p['num_days']} hari)*")
-        md.append(f"- **Modal Rata-rata Bandar ({p['num_days']} Hari):** `Rp {p['top_buyer_avg']:.1f}`")
-        md.append(f"- **Margin Harga terhadap Modal Bandar:** `{p['margin_pct']:+.1f}%` *(Sangat presisi, bandar belum bisa exit!)*")
-        md.append(f"- **Aliran Dana Mingguan:** Smart Money **`+{format_rupiah(p['smart_net'])}`** ➔ Ritel Terkuras **`{format_rupiah(p['retail_net'])}`**")
+        md.append(f"- **Broker Smart-Money Utama:** **`{p['top_buyer']}`** Net Buy `{format_rupiah(p['top_buyer_net'])}` *(Aktif beli di {p['active_days']} dari {p['num_days']} hari)*")
+        md.append(f"- **Rata-rata Pembelian Broker ({p['num_days']} Hari):** `Rp {p['top_buyer_avg']:.1f}`")
+        md.append(f"- **Margin Harga terhadap Rata-rata Broker:** `{p['margin_pct']:+.1f}%` *(indikator jarak, bukan bukti posisi terbuka)*")
+        md.append(f"- **Aliran Dana Terklasifikasi:** Smart **`+{format_rupiah(p['smart_net'])}`** ➔ Kode Ritel **`{format_rupiah(p['retail_net'])}`**")
         md.append(f"\n📋 **Rencana Swing Trading (Holding 3 - 10 Hari):**")
         md.append(f"| Area Akumulasi (Entry) | Target 1 (TP1 +7%) | Target 2 (TP2 +15%) | Batas Pengaman (SL) | Risk/Reward |")
         md.append(f"| :---: | :---: | :---: | :---: | :---: |")
@@ -360,13 +465,13 @@ def generate_swing_report(picks: list[dict[str, Any]], target_date: str, dates: 
         md.append("\n" + "-" * 50 + "\n")
 
     md.append("## 📊 TABEL RADAR SELURUH KANDIDAT SWING CONFLUENCE\n")
-    md.append("| No | Saham | Close | HOD (%) | Top Bandar | Net Val | Modal 5D | Margin | Smart Net | Ritel Net | Skor |")
+    md.append("| No | Saham | Close | HOD (%) | Top Broker | Net Val | Avg Periode | Margin | Smart Net | Ritel Net | Skor |")
     md.append("|:--:|:-----:|:-----:|:-------:|:----------:|:-------:|:--------:|:------:|:---------:|:---------:|:----:|")
     
     for i, p in enumerate(picks, 1):
         md.append(f"| {i} | **{p['symbol']}** | {int(p['close']):,} | {p['hod_pct']:.1f}% | {p['top_buyer']} ({p['active_days']}/{p['num_days']}d) | {format_rupiah(p['top_buyer_net'])} | {p['top_buyer_avg']:.0f} | {p['margin_pct']:+.1f}% | +{format_rupiah(p['smart_net'])} | {format_rupiah(p['retail_net'])} | **{p['score']:.0f}** |")
 
-    md.append("\n\n---\n*Peringatan Risiko: Strategi Swing menuntut kedisiplinan menahan posisi selama beberapa hari bursa. Selalu batasi risiko dengan Stop Loss tepat di bawah harga modal rata-rata bandar.*")
+    md.append("\n\n---\n*Peringatan Risiko: Kandidat ini bersifat heuristik dan bergantung pada cakupan data broker/L2 yang tersedia. Verifikasi fraksi harga dan risiko sebelum mengambil keputusan.*")
     return "\n".join(md)
 
 
@@ -375,20 +480,28 @@ def main():
     parser.add_argument("--date", type=str, help="Target Date YYYY-MM-DD", default=None)
     parser.add_argument("--days", type=int, default=5, help="Number of trading days lookback (default: 5)")
     parser.add_argument("--min-val", type=float, default=10_000_000_000, help="Minimum total turnover IDR (default: 10B)")
-    parser.add_argument("--max-margin", type=float, default=6.0, help="Maximum margin above bandar cost (default: 6%%)")
-    parser.add_argument("--no-l2", action="store_true", help="Disable automatic L2 targeted fetching")
+    parser.add_argument("--max-margin", type=float, default=6.0, help="Maximum margin above broker average (default: 6%%)")
+    parser.add_argument("--no-l2", action="store_true", help="Jangan fetch L2; hanya gunakan hari L2 yang sudah ditandai lengkap")
+    parser.add_argument("--no-eod", action="store_true", help="Jangan fetch broker EOD; gunakan baris EOD yang sudah ada")
     args = parser.parse_args()
 
+    if args.days < 2:
+        parser.error("--days minimal 2 untuk analisis multi-day")
+
     conn = connect_database()
+    initialize_schema(conn)
     if args.date:
-        target_date = args.date
+        try:
+            target_date = datetime.date.fromisoformat(args.date).isoformat()
+        except ValueError:
+            parser.error("--date harus berformat YYYY-MM-DD")
     else:
-        row = conn.execute("SELECT max(date) as d FROM stockbit_ws.broker_l2_ticks").fetchone()
-        if not row or not row.get("d"):
-            print("❌ Tidak ada data L2 Ticks di database.")
-            conn.close()
-            return
-        target_date = row["d"].isoformat()
+        row = conn.execute("SELECT max(date) as d FROM stockbit_ws.broker_stock_activity").fetchone()
+        if row and row.get("d"):
+            target_date = row["d"].isoformat()
+        else:
+            from stockbit_ws.exodus import _resolve_default_date
+            target_date = _resolve_default_date().isoformat()
     conn.close()
 
     print(f"🌊 Menjalankan Multi-Day Swing Confluence Engine untuk {target_date}...")
@@ -400,6 +513,7 @@ def main():
         min_total_turnover=args.min_val,
         max_margin_pct=args.max_margin,
         auto_fetch_l2=not args.no_l2,
+        auto_fetch_eod=not args.no_eod,
     )
 
     date_range_str = f"{dates[0]} s/d {dates[-1]}" if dates else target_date
@@ -416,8 +530,8 @@ def main():
 
     for i, p in enumerate(picks[:5], 1):
         print(f"{i}. [{p['grade']}] {p['symbol']} (Close: {int(p['close']):,} | Skor: {p['score']:.0f}/100)")
-        print(f"   Bandar: {p['top_buyer']} Net +{format_rupiah(p['top_buyer_net'])} @ Modal 5D {p['top_buyer_avg']:.0f} (Margin: {p['margin_pct']:+.1f}%)")
-        print(f"   Aliran: Smart Money +{format_rupiah(p['smart_net'])} vs Ritel {format_rupiah(p['retail_net'])} ({p['active_days']}/{p['num_days']} hari aktif)")
+        print(f"   Broker smart: {p['top_buyer']} Net +{format_rupiah(p['top_buyer_net'])} @ Avg Periode {p['top_buyer_avg']:.0f} (Margin: {p['margin_pct']:+.1f}%)")
+        print(f"   Aliran terklasifikasi: Smart +{format_rupiah(p['smart_net'])} vs Ritel {format_rupiah(p['retail_net'])} ({p['active_days']}/{p['num_days']} hari aktif)")
         print(f"   Plan Swing: Entry {p['plan']['entry']} | TP1: {p['plan']['tp1']} | TP2: {p['plan']['tp2']} | SL: {p['plan']['sl']}")
         print("-" * 65)
 

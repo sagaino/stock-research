@@ -113,6 +113,14 @@ def initialize_schema(connection):
         )""")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_broker_stock_sym_date ON stockbit_ws.broker_stock_activity(symbol, date DESC)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_broker_top_date ON stockbit_ws.broker_top_daily(date DESC)")
+        connection.execute("""CREATE TABLE IF NOT EXISTS stockbit_ws.broker_eod_ingestion (
+            date date PRIMARY KEY,
+            top_n integer NOT NULL CHECK(top_n > 0),
+            brokers_requested integer NOT NULL CHECK(brokers_requested >= 0),
+            brokers_processed integer NOT NULL CHECK(brokers_processed >= 0),
+            activities_stored bigint NOT NULL CHECK(activities_stored >= 0),
+            completed_at timestamptz NOT NULL DEFAULT now()
+        )""")
         connection.execute("""CREATE TABLE IF NOT EXISTS stockbit_ws.broker_l2_ticks (
             id text PRIMARY KEY,
             date date NOT NULL,
@@ -129,6 +137,13 @@ def initialize_schema(connection):
         )""")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_l2_ticks_date_symbol ON stockbit_ws.broker_l2_ticks(date, symbol)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_l2_ticks_trade_number ON stockbit_ws.broker_l2_ticks(trade_number)")
+        connection.execute("""CREATE TABLE IF NOT EXISTS stockbit_ws.broker_l2_ingestion (
+            date date NOT NULL,
+            symbol text NOT NULL,
+            completed_at timestamptz NOT NULL DEFAULT now(),
+            last_trade_number bigint,
+            PRIMARY KEY (date, symbol)
+        )""")
 
 
 class PostgresRecorder:

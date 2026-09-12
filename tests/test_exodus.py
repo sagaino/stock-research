@@ -16,6 +16,7 @@ from stockbit_ws.exodus import (
     _safe_numeric,
     _resolve_default_date,
     fetch_top_brokers,
+    fetch_broker_activity,
     store_top_brokers,
     store_broker_activity,
     load_exodus_token
@@ -98,6 +99,119 @@ class TestExodusUnit(unittest.TestCase):
         res = fetch_top_brokers(client, datetime.date(2026, 9, 10))
         self.assertEqual(res, [])
 
+    def test_fetch_top_brokers_sorts_by_total_value_locally(self):
+        client = MagicMock(spec=httpx.Client)
+        response = MagicMock()
+        response.json.return_value = {
+            "data": {
+                "list": [
+                    {"code": "SMALL", "total_value": "10"},
+                    {"code": "BIG", "total_value": "100"},
+                ]
+            }
+        }
+        client.get.return_value = response
+
+        rows = fetch_top_brokers(client, datetime.date(2026, 9, 10))
+        self.assertEqual([row["code"] for row in rows], ["BIG", "SMALL"])
+
+    def test_fetch_top_brokers_rejects_mismatched_response_window(self):
+        client = MagicMock(spec=httpx.Client)
+        response = MagicMock()
+        response.json.return_value = {
+            "data": {"from": "2026-09-11", "to": "2026-09-11", "list": []}
+        }
+        client.get.return_value = response
+
+        with self.assertRaises(ValueError):
+            fetch_top_brokers(client, datetime.date(2026, 9, 10))
+
+    def test_historical_activity_uses_explicit_date_window(self):
+        client = MagicMock(spec=httpx.Client)
+        response = MagicMock()
+        response.json.return_value = {"data": {"from": "2026-09-10", "to": "2026-09-10"}}
+        client.get.return_value = response
+
+        self.assertEqual(
+            fetch_broker_activity(client, "YU", target_date=datetime.date(2026, 9, 10)),
+            [],
+        )
+        params = client.get.call_args.kwargs["params"]
+        self.assertEqual(params["from"], "2026-09-10")
+        self.assertEqual(params["to"], "2026-09-10")
+        self.assertNotIn("period", params)
+
+    def test_historical_activity_rejects_mismatched_response_window(self):
+        client = MagicMock(spec=httpx.Client)
+        response = MagicMock()
+        response.json.return_value = {"data": {"from": "2026-09-11", "to": "2026-09-11"}}
+        client.get.return_value = response
+
+        with self.assertRaises(ValueError):
+            fetch_broker_activity(client, "YU", target_date=datetime.date(2026, 9, 10))
+
+    @patch("stockbit_ws.exodus.time.sleep")
+    def test_relative_activity_keeps_period_compatibility(self, _sleep):
+        client = MagicMock(spec=httpx.Client)
+        response = MagicMock()
+        response.json.return_value = {
+            "data": {
+                "broker_activity_transaction": {
+                    "brokers_buy": [{"stock_code": "ANTM", "value": 100}],
+                    "brokers_sell": [],
+                }
+            }
+        }
+        empty = MagicMock()
+        empty.json.return_value = {"data": {}}
+        client.get.side_effect = [response, empty]
+
+        rows = fetch_broker_activity(client, "YU")
+        self.assertEqual(rows[0]["_side"], "buy")
+        params = client.get.call_args_list[0].kwargs["params"]
+        self.assertEqual(params["period"], "RT_PERIOD_LAST_1_DAY")
+        self.assertNotIn("from", params)
+
+    def test_activity_lists_keep_buy_sell_side(self):
+        client = MagicMock(spec=httpx.Client)
+        response = MagicMock()
+        response.json.return_value = {
+            "data": {
+                "broker_activity_transaction": {
+                    "brokers_buy": [{"stock_code": "DSSA", "value": 200}],
+                    "brokers_sell": [{"stock_code": "DSSA", "value": 50}],
+                }
+            }
+        }
+        client.get.side_effect = [response, MagicMock(json=lambda: {"data": {}})]
+
+        rows = fetch_broker_activity(client, "YU", target_date=datetime.date(2026, 9, 10))
+        self.assertEqual([row["_side"] for row in rows], ["buy", "sell"])
+
+    @patch("stockbit_ws.exodus.time.sleep")
+    def test_activity_pagination_is_not_truncated_at_ten_pages(self, _sleep):
+        client = MagicMock(spec=httpx.Client)
+        pages = []
+        for page in range(11):
+            response = MagicMock()
+            response.json.return_value = {
+                "data": {
+                    "broker_activity_transaction": {
+                        "brokers_buy": [{"stock_code": f"S{page}", "value": 1}],
+                        "brokers_sell": [],
+                    }
+                }
+            }
+            pages.append(response)
+        empty = MagicMock()
+        empty.json.return_value = {"data": {}}
+        pages.append(empty)
+        client.get.side_effect = pages
+
+        rows = fetch_broker_activity(client, "YU", target_date=datetime.date(2026, 9, 10))
+        self.assertEqual(len(rows), 11)
+        self.assertEqual(client.get.call_count, 12)
+
     @patch("stockbit_ws.exodus.load_environment")
     def test_token_not_set_raises_value_error(self, mock_env):
         mock_env.return_value = {}
@@ -179,3 +293,19 @@ class TestExodusIntegration(unittest.TestCase):
             (self.test_date,)
         ).fetchone()
         self.assertEqual(row["net_value"], 300)
+
+    def test_store_broker_activity_aggregates_buy_and_sell_rows(self):
+        activities = [
+            {"stock_code": "DSSA", "value": "200", "lot": "2", "avg_price": "100", "_side": "buy"},
+            {"stock_code": "DSSA", "value": "-50", "lot": "-1", "avg_price": "50", "_side": "sell"},
+        ]
+        self.assertEqual(store_broker_activity(self.conn, self.test_date, "YU", activities), 1)
+        row = self.conn.execute(
+            "SELECT net_value, buy_value, sell_value, buy_lot, sell_lot FROM stockbit_ws.broker_stock_activity WHERE date = %s AND symbol = 'DSSA'",
+            (self.test_date,)
+        ).fetchone()
+        self.assertEqual(float(row["net_value"]), 150)
+        self.assertEqual(float(row["buy_value"]), 200)
+        self.assertEqual(float(row["sell_value"]), 50)
+        self.assertEqual(float(row["buy_lot"]), 2)
+        self.assertEqual(float(row["sell_lot"]), 1)

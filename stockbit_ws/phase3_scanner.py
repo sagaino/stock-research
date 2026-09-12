@@ -1,10 +1,8 @@
 import argparse
 import datetime
-import itertools
-from collections import defaultdict
-from stockbit_ws.postgres import connect_database
-
-RETAIL_BROKERS = {"YP", "PD", "XC", "NI", "CC", "XL"}
+from collections import defaultdict, deque
+from stockbit_ws.postgres import connect_database, initialize_schema
+from stockbit_ws.broker_groups import broker_group
 ICEBERG_MIN_FREQ = 20  # Minimum ticks to be considered an iceberg
 ICEBERG_MAX_AVG_LOT = 50 # Small lots
 
@@ -18,7 +16,7 @@ def format_rupiah(value):
 
 def scan_iceberg(ticks):
     """
-    Detect Iceberg buying: high frequency of small lot buys by the same broker at a specific price.
+    Heuristic: repeated small-lot buys by the same broker at a specific price.
     Returns list of dicts.
     """
     buy_ticks = [t for t in ticks if t['action'] == 'buy']
@@ -53,8 +51,8 @@ def scan_iceberg(ticks):
 
 def scan_absorption(ticks):
     """
-    Detect who is absorbing retail panic selling.
-    Looks at 'sell' action (HAKI) where seller is retail.
+    Heuristic for a non-retail broker repeatedly taking prints from a
+    configured retail-code cohort.
     """
     sell_ticks = [t for t in ticks if t['action'] == 'sell']
     absorption_vol = defaultdict(int)
@@ -69,7 +67,7 @@ def scan_absorption(ticks):
         scode = t['seller_code'].split()[0]
         bcode = t['buyer_code'].split()[0]
         
-        if scode in RETAIL_BROKERS:
+        if broker_group(scode) == "retail":
             vol = t['lot']
             val = vol * 100 * t['price']
             
@@ -81,7 +79,7 @@ def scan_absorption(ticks):
             
     absorbers = []
     for broker, vol in absorption_vol.items():
-        if broker not in RETAIL_BROKERS and vol > 0:
+        if broker_group(broker) == "smart" and vol > 0:
             val = absorption_val[broker]
             pct_vol = (vol / total_retail_dump_vol) * 100 if total_retail_dump_vol > 0 else 0
             if pct_vol >= 5.0:
@@ -97,68 +95,56 @@ def scan_absorption(ticks):
 
 def scan_sweeping(ticks):
     """
-    Detect aggressive sweeping: same buyer, sequential rapid buys crossing multiple price levels.
+    Detect rapid same-broker buy prints across multiple prices.  This is a
+    trade-print heuristic; the feed does not contain the offer queue itself.
     """
     buy_ticks = [t for t in ticks if t['action'] == 'buy']
-    sweeps = []
-    
-    for i in range(len(buy_ticks)):
-        base_t = buy_ticks[i]
-        bcode = base_t['buyer_code'].split()[0] if base_t['buyer_code'] else None
-        if not bcode: continue
-        
-        prices_hit = {base_t['price']}
-        total_vol = base_t['lot']
-        total_val = base_t['lot'] * 100 * base_t['price']
-        end_idx = i
-        
-        for j in range(i + 1, len(buy_ticks)):
-            next_t = buy_ticks[j]
-            next_bcode = next_t['buyer_code'].split()[0] if next_t['buyer_code'] else None
-            
-            if next_bcode != bcode:
-                break
-                
-            t1 = datetime.datetime.combine(datetime.date.today(), base_t['time'])
-            t2 = datetime.datetime.combine(datetime.date.today(), next_t['time'])
-            diff = (t2 - t1).total_seconds()
-            
-            if diff > 3:
-                break
-                
-            prices_hit.add(next_t['price'])
-            total_vol += next_t['lot']
-            total_val += next_t['lot'] * 100 * next_t['price']
-            end_idx = j
-            
-        if len(prices_hit) >= 3 and end_idx > i:
-            sweeps.append({
-                "broker": bcode,
-                "time": base_t['time'].strftime("%H:%M:%S"),
-                "prices": sorted(list(prices_hit)),
-                "total_lot": total_vol,
-                "total_value": total_val
-            })
-            
-    dedup = {}
-    for s in sweeps:
-        key = (s['broker'], s['time'])
-        if key not in dedup or dedup[key]['total_value'] < s['total_value']:
-            dedup[key] = s
-            
-    return sorted(list(dedup.values()), key=lambda x: x['time'])
+    windows = defaultdict(deque)
+    sweeps = {}
+
+    def seconds(value):
+        return value.hour * 3600 + value.minute * 60 + value.second
+
+    for tick in buy_ticks:
+        bcode = tick['buyer_code'].split()[0] if tick['buyer_code'] else None
+        if not bcode:
+            continue
+        window = windows[bcode]
+        tick_seconds = seconds(tick['time'])
+        while window and tick_seconds - seconds(window[0]['time']) > 3:
+            window.popleft()
+        window.append(tick)
+        prices_hit = {item['price'] for item in window}
+        if len(prices_hit) < 3:
+            continue
+        base_t = window[0]
+        total_lot = sum(item['lot'] for item in window)
+        total_value = sum(item['lot'] * 100 * item['price'] for item in window)
+        time_label = base_t['time'].strftime("%H:%M:%S")
+        key = (bcode, time_label)
+        candidate = {
+            "broker": bcode,
+            "time": time_label,
+            "prices": sorted(prices_hit),
+            "total_lot": total_lot,
+            "total_value": total_value,
+        }
+        if key not in sweeps or sweeps[key]["total_value"] < total_value:
+            sweeps[key] = candidate
+
+    return sorted(sweeps.values(), key=lambda x: x['time'])
 
 def generate_session_story(ticks):
     """
     Reconstruct the chronological timeline and narrative of each session phase with exact Rupiah values.
     """
     phases = [
-        ("08:45:00", "10:00:00", "Sesi 1 Pagi (Morning Wave)"),
-        ("10:00:00", "11:30:00", "Sesi 1 Siang (Konsolidasi/Cooling)"),
-        ("13:30:00", "15:00:00", "Sesi 2 Awal (Akumulasi/Konsolidasi)"),
-        ("15:00:00", "15:35:00", "Sesi 2 Sore (Rampage / Euphoria)"),
-        ("15:35:00", "15:50:00", "Sesi 2 Akhir (Distribusi / Panic Dump)"),
-        ("15:50:00", "16:15:00", "Closing & Post-Closing (Pencocokan Akhir)")
+        ("09:00:00", "10:00:00", "Pagi Awal"),
+        ("10:00:00", "12:00:00", "Pagi Lanjutan"),
+        ("13:30:00", "15:00:00", "Siang Awal"),
+        ("15:00:00", "15:35:00", "Sore Awal"),
+        ("15:35:00", "15:50:00", "Sore Akhir"),
+        ("15:50:00", "16:15:00", "Penutupan")
     ]
     
     results = []
@@ -243,9 +229,24 @@ def main():
     args = parser.parse_args()
     
     symbol = args.symbol.upper()
-    target_date = args.date or datetime.date.today().isoformat()
+    if args.date:
+        try:
+            target_date = datetime.date.fromisoformat(args.date).isoformat()
+        except ValueError:
+            parser.error("--date harus berformat YYYY-MM-DD")
+    else:
+        target_date = datetime.date.today().isoformat()
     
     conn = connect_database()
+    initialize_schema(conn)
+    complete = conn.execute(
+        "SELECT 1 FROM stockbit_ws.broker_l2_ingestion WHERE date = %s AND (symbol = '*' OR symbol = %s) LIMIT 1",
+        (target_date, symbol),
+    ).fetchone()
+    if not complete:
+        print(f"❌ L2 {symbol} pada {target_date} belum ditandai lengkap.")
+        conn.close()
+        return
     cur = conn.cursor()
     
     query = """
@@ -285,25 +286,25 @@ def main():
     
     if icebergs:
         top_ice = icebergs[0]
-        narrative.append(f"Terdeteksi broker {top_ice['broker']} melakukan Iceberg Buying ({top_ice['frequency']} kali HAKA) dominan di harga {top_ice['price']} senilai {format_rupiah(top_ice['total_value'])}.")
+        narrative.append(f"Heuristik pola buy kecil berulang: broker {top_ice['broker']} ({top_ice['frequency']} kali HAKA) dominan di harga {top_ice['price']} senilai {format_rupiah(top_ice['total_value'])}.")
     
     if absorbers and total_dump_vol > 0:
         top_abs = absorbers[0]
-        narrative.append(f"Saat ritel panik HAKI sebesar {format_rupiah(total_dump_val)}, broker {top_abs['broker']} menampung {top_abs['percentage']}% guyuran tersebut senilai {format_rupiah(top_abs['absorbed_value'])} (Avg Harga: {top_abs['avg_price']}).")
+        narrative.append(f"Dalam penjualan kode ritel sebesar {format_rupiah(total_dump_val)}, broker {top_abs['broker']} mengambil {top_abs['percentage']}% print tersebut senilai {format_rupiah(top_abs['absorbed_value'])} (Avg Harga: {top_abs['avg_price']}).")
         
     if sweeps:
         s = sweeps[-1]
-        narrative.append(f"Pada jam {s['time']}, broker {s['broker']} secara buas menyapu HAKA {len(s['prices'])} level harga {s['prices']} sekaligus senilai {format_rupiah(s['total_value'])}!")
+        narrative.append(f"Pada jam {s['time']}, broker {s['broker']} mencetak buy pada {len(s['prices'])} level harga {s['prices']} dalam jendela cepat senilai {format_rupiah(s['total_value'])}.")
         
     if not narrative:
-        print("Tidak ada pergerakan Smart Money yang mencolok. Kondisi tape netral/sepi.")
+        print("Tidak ada pola trade-print yang mencolok. Kondisi tape netral/sepi.")
     else:
         for n in narrative:
             print(" ► " + n)
             
     print("\n--------------------------------------------------")
     print("📋 DATA PENDUKUNG (TEKNIS):")
-    print("\n[1] ICEBERG DETECTOR (Top 3):")
+    print("\n[1] REPEATED SMALL-BUY HEURISTIC (Top 3):")
     if icebergs:
         for i, x in enumerate(icebergs[:3]):
             print(f"    {i+1}. {x['broker']} di harga {x['price']} | {x['frequency']}x | {x['total_lot']} lot ({format_rupiah(x['total_value'])})")
@@ -317,7 +318,7 @@ def main():
     else:
         print("    Nihil")
         
-    print("\n[3] AGGRESSIVE SWEEPS (Sapu Rata):")
+    print("\n[3] RAPID MULTI-PRICE BUY HEURISTIC:")
     if sweeps:
         for x in sweeps:
             print(f"    - Jam {x['time']} | {x['broker']} sapu {len(x['prices'])} level {x['prices']} | {x['total_lot']:,} lot ({format_rupiah(x['total_value'])})")
@@ -368,7 +369,7 @@ def main():
         print(f"  • Net Distribusi: {net_sell_str}")
     print()
 
-    # SECTION 5: FULL DAY EOD BROKER SUMMARY (EXACT STOCKBIT REPLICA)
+    # SECTION 5: derived full-day broker summary from captured prints
     eod_brokers = defaultdict(lambda: {'b_lot': 0.0, 'b_val': 0.0, 's_lot': 0.0, 's_val': 0.0})
     for t in ticks:
         price = t['price']
@@ -418,7 +419,7 @@ def main():
         return f"{l:,.0f}"
 
     print("--------------------------------------------------")
-    print("🏆 [5] BROKER SUMMARY TOTAL 1 HARI (EOD STOCKBIT NET VIEW):")
+    print("🏆 [5] RINGKASAN BROKER 1 HARI (DITURUNKAN DARI L2):")
     print(f"{'BY':<4} {'B.val':<8} {'B.lot':<8} {'B.avg':<6} | {'SL':<4} {'S.val':<8} {'S.lot':<8} {'S.avg':<6}")
     print("-" * 55)
     

@@ -259,7 +259,7 @@ Urutan rollout, perbedaan yang disengaja, dan hasil verifikasi tercatat di [pand
 
 ## 🏛️ Smart Money & Bandarmologi Intelligence Suite
 
-Suite analisis data institusional dan mikrostruktur bursa berbasis data resmi bursa Stockbit (Exodus API & Running Trade L2):
+Suite analisis heuristik dari data broker dan running-trade Stockbit (Exodus API & Running Trade L2):
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -280,65 +280,82 @@ Suite analisis data institusional dan mikrostruktur bursa berbasis data resmi bu
 ### 1. Ingestion Data Exodus & L2
 
 #### A. Rangkuman Broker EOD (`stockbit-exodus`)
-Menyedot data ranking broker dan portofolio belanjaan 20 broker teratas:
+Menyedot ranking broker dan aktivitas saham dari broker teratas yang dikembalikan API:
 ```bash
 uv run stockbit-exodus                    # Menarik data hari bursa terakhir
-uv run stockbit-exodus --date 2026-09-11  # Menarik tanggal historis tertentu
+uv run stockbit-exodus --date 2026-09-11  # Menarik EOD pada tanggal tertentu
 ```
-*Tabel Database:* `stockbit_ws.broker_top_daily` & `stockbit_ws.broker_stock_activity`.
+`--date` adalah tanggal audit tunggal: ranking top broker dan drill-down
+aktivitas dikirim sebagai jendela `from=to=YYYY-MM-DD`, bukan preset periode
+relatif. Jalankan ulang tanggal yang sama untuk memperbarui baris secara
+idempoten; data lama yang pernah diambil dengan preset relatif perlu di-ingest
+ulang sebelum dipakai untuk perbandingan historis.
+Baris beli/jual API sama-sama bernilai positif; ingestion mempertahankan sisi
+transaksi lalu mengagregasikannya per broker-saham sebelum menghitung net.
+Pagination berjalan sampai halaman kosong, sehingga aktivitas broker tidak
+dipotong pada batas 500 baris.
+*Tabel Database:* `stockbit_ws.broker_top_daily`, `stockbit_ws.broker_stock_activity`, dan marker kelengkapan `stockbit_ws.broker_eod_ingestion`.
 
 #### B. Running Trade L2 Detik-per-Detik (`stockbit-l2`)
-Mesin penyedot *Heavy Duty* dilengkapi pelindung **Auto-Resume** (melanjutkan dari titik terakhir), **Dynamic Pacing** (1-1.5s delay), dan **Smart Backoff** (istirahat 60s saat 503/429):
+Mesin penyedot *Heavy Duty* dilengkapi **Auto-Resume**, **Dynamic Pacing** (1–1,5 detik per halaman), **Smart Backoff** (60 detik saat 503/429), serta penanda scrape lengkap:
 ```bash
-# Mode Targeted (Cepat - Hanya butuh 10-30 detik):
+# Mode Targeted (hanya simbol yang dipilih; durasi bergantung jumlah tick):
 uv run stockbit-l2 --symbols ANTM,AALI,PTBA --date 2026-09-11
 
-# Mode Wildcard Seluruh Pasar (Mengeruk ±1.9 Juta transaksi IHSG):
+# Mode Wildcard Seluruh Pasar (sekitar 1,9 juta tick; beberapa jam):
 uv run stockbit-l2 --wildcard --date 2026-09-11
 ```
-*Tabel Database:* `stockbit_ws.broker_l2_ticks`.
+*Tabel Database:* `stockbit_ws.broker_l2_ticks` dan penanda kelengkapan `stockbit_ws.broker_l2_ingestion`.
 
 ---
 
 ### 2. Forensik Mikrostruktur Saham (`stockbit-phase3`)
 
-Membongkar taktik rahasia bandar dan merekonstruksi kronologi perjalanan harga dari jam 09:00 sampai 16:15 sore:
+Meringkas pola trade-print dan kronologi harga dari jam 09:00 sampai 16:15 sore:
 ```bash
 uv run stockbit-phase3 --symbol MUTU --date 2026-09-11
 uv run stockbit-phase3 --symbol VKTR --date 2026-09-11
 ```
 
 **Fitur Analisis:**
-- **[1] Iceberg Detector:** Melacak bot bandar yang memecah order raksasa menjadi puluhan lot kecil.
-- **[2] Absorption Detector:** Mendeteksi broker institusi yang menampung guyuran kepanikan ritel di harga dasar.
-- **[3] Aggressive Sweeps:** Menangkap momen saat bandar menyapu *offer* di 3+ level harga dalam hitungan detik.
+- **[1] Repeated Small-Buy Heuristic:** Menandai buy kecil berulang dari broker yang sama pada harga yang sama; bukan bukti hidden order.
+- **[2] Absorption Heuristic:** Menandai broker smart-money terklasifikasi yang mengambil print jual dari kode ritel terklasifikasi.
+- **[3] Rapid Multi-Price Buys:** Menandai print buy broker yang sama pada 3+ harga dalam jendela cepat; bukan pembacaan antrean *offer*.
 - **[4] Intraday Story Timeline:** Rekonstruksi babak demi babak (Pagi, Siang, Sore) lengkap dengan **Lot**, **Nilai Rp**, **Harga Rata-rata (Avg)**, dan **Rentang Harga [Min-Max]**.
-- **[5] Broker Summary EOD Replica:** Tabel net broker harian 100% identik dengan tampilan resmi Stockbit.
+- **[5] Derived Broker Summary:** Ringkasan net broker yang dihitung dari tick L2 yang tersimpan; bukan replika resmi yang telah diverifikasi.
+
+Phase3 hanya membaca hari/simbol yang memiliki marker L2 lengkap (wildcard atau
+targeted simbol); keberadaan sebagian tick tidak dianggap selesai.
 
 ---
 
 ### 3. Sinyal BPJU / Scalping Pagi (`stockbit-confluence`)
 
-Sinyal **Beli Pagi Jual Untung (BPJU)** berbasis **5 Pilar Confluence Anti-Ritel Trap** untuk mengamankan profit **+2.0% s/d +5.0%** di pagi hari:
+Kandidat **Beli Pagi Jual Untung (BPJU)** berbasis lima filter heuristik. Target di bawah adalah skenario, bukan jaminan profit:
 ```bash
 uv run stockbit-confluence                    # Tanggal terbaru
 uv run stockbit-confluence --date 2026-09-11  # Tanggal spesifik
 ```
 
 **Kriteria Seleksi (5 Pilar):**
-1. Pembeli utama (*Top 1 Net Buyer*) **wajib** broker institusi/asing, bukan ritel (`XL, YP, XC, PD, NI`).
-2. Pasukan ritel tercatat melakukan **Net Sell masif** (barang berpindah dari ritel ke bandar).
+1. Pembeli utama (*Top 1 Net Buyer*) harus ada dalam daftar broker smart-money terkonfigurasi.
+2. Kode ritel terkonfigurasi (`XL, YP, XC, PD, NI`) harus net sell.
 3. Harga ditutup di puncak (*Close >= 95% - 100% of High of Day*).
-4. Harga closing masih nempel di area modal bandar (*Margin < +4%*).
+4. Harga closing masih dekat dengan rata-rata beli broker (*Margin < +4%*).
 5. Likuiditas sehat (Turnover minimal Rp 5 Miliar).
 
-*Output:* Rekomendasi Grade A+ & A lengkap dengan **Area Masuk Pagi**, **TP1 (+2.5%)**, **TP2 (+5.0%)**, **Stop Loss**, dan arsip laporan di `reports/bsjp_confluence_YYYYMMDD.md`.
+*Output:* Grade heuristik (termasuk kandidat spekulatif) lengkap dengan **Area Masuk Pagi**, **TP1 (+2.5%)**, **TP2 (+5.0%)**, **Stop Loss** yang dibulatkan ke fraksi harga IDX, dan arsip laporan di `reports/bsjp_confluence_YYYYMMDD.md`.
+Scanner ini membutuhkan marker wildcard L2 lengkap pada tanggal target; data
+targeted saja tidak cukup untuk menyaring seluruh pasar.
+Untuk dataset lama yang Anda yakini sudah selesai tetapi belum punya marker,
+gunakan override eksplisit `--trust-existing-l2`; override ini tidak membuat
+marker baru dan tetap menampilkan peringatan.
 
 ---
 
 ### 4. Sinyal Swing Multi-Day (`stockbit-swing`)
 
-Sinyal **Swing Confluence** (+7% s/d +15%) yang mengawinkan data akumulasi sepekan (Phase 1) dengan mikrostruktur hari pelatuk (Phase 3). Dilengkapi dengan teknologi **Targeted L2 Sniper Funnel**:
+Kandidat **Swing Confluence** (+7% s/d +15%) menggabungkan data akumulasi beberapa hari yang tersedia dengan mikrostruktur hari pelatuk. Dilengkapi **Targeted L2 Sniper Funnel**:
 ```bash
 # Menjalankan screening 5 hari bursa (default):
 uv run stockbit-swing
@@ -346,14 +363,16 @@ uv run stockbit-swing
 # Custom periode dan turnover:
 uv run stockbit-swing --days 5 --min-val 10000000000
 
-# Mode Super Cepat Offline (tanpa cek L2):
+# Tanpa fetch jaringan; tetap membutuhkan hari L2 yang sudah ditandai lengkap:
 uv run stockbit-swing --no-l2
+
+# Offline penuh: jangan fetch EOD maupun L2:
+uv run stockbit-swing --no-eod --no-l2
 ```
 
 **Alur Kerja Otomatis (Targeted L2 Sniper Funnel):**
-1. Mesin menyaring seluruh bursa mencari saham dengan **Smart Money Net Buy puluhan Miliar** selama 5 hari berturut-turut.
-2. Mesin mengekstrak **Top 10-15 saham akumulasi terbaik**.
-3. Jika data L2 hari Jumat untuk 10 saham tersebut belum ada di database, mesin **secara otomatis hanya menyedot L2 untuk 10 saham itu saja** (~30 detik, tanpa perlu menunggu scraping 7 jam!).
-4. Menghasilkan *Swing Trading Plan* dengan batas pengaman *Cut Loss* tepat di bawah modal rata-rata mingguan bandar (*5D Cost Basis*).
+1. Mesin memastikan marker EOD tersedia untuk maksimal `--days` tanggal bursa; tanggal yang hilang atau belum lengkap di-fetch lewat Exodus. Weekend/holiday yang tidak mengembalikan data dilewati.
+2. Mesin menyaring broker smart-money net-buy minimal 4/5 hari dan kode ritel net-sell minimal 3/5 hari, dengan total ritel tetap net-sell; lalu mengambil maksimal **25 kandidat** dengan smart-net terbesar.
+3. Jika belum ada penanda scrape L2 lengkap, mesin menyedot tiap kandidat secara targeted; durasi bergantung jumlah tick, bukan angka tetap 30 detik.
+4. Menghasilkan *Swing Trading Plan* dengan harga yang dibulatkan ke fraksi IDX dan stop di bawah rata-rata broker periode.
 *Arsip Laporan:* `reports/swing_confluence_YYYYMMDD.md`.
-
