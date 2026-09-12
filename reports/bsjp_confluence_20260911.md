@@ -1,5 +1,5 @@
 # 🚀 LAPORAN REKOMENDASI BSJP SUPER HIGH WIN-RATE
-**Tanggal Analisis:** `2026-09-11` | **Waktu Rilis:** `2026-09-12 17:52:51`
+**Tanggal Analisis:** `2026-09-11` | **Waktu Rilis:** `2026-09-12 17:55:11`
 **Engine:** `Stockbit Exodus L2 Microstructure & Smart Money Confluence`
 
 ---
