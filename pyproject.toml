@@ -29,6 +29,8 @@ stockbit-bsjp = "stockbit_ws.bsjp:main"
 stockbit-exodus = "stockbit_ws.exodus:main"
 stockbit-l2 = "stockbit_ws.exodus_l2:main"
 stockbit-phase3 = "stockbit_ws.phase3_scanner:main"
+stockbit-bsjp-pro = "stockbit_ws.bsjp_confluence:main"
+stockbit-confluence = "stockbit_ws.bsjp_confluence:main"
 
 [tool.setuptools.packages.find]
 include = ["stockbit_ws*"]
