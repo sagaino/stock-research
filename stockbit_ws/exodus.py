@@ -175,11 +175,7 @@ def fetch_broker_activity(
 
 
 def store_top_brokers(conn, date: datetime.date, brokers: list[dict]) -> int:
-    """Upsert top broker data ke stockbit_ws.broker_top_daily.
-    
-    Menggunakan ON CONFLICT DO UPDATE agar re-run aman (idempotent).
-    Returns: jumlah row yang diproses.
-    """
+    """Replace the daily top-broker snapshot and return its row count."""
     if not brokers:
         return 0
     rows = [
@@ -198,7 +194,10 @@ def store_top_brokers(conn, date: datetime.date, brokers: list[dict]) -> int:
         for b in brokers
         if b.get("code")
     ]
+    if not rows:
+        raise ValueError("Top broker response contains no broker code")
     with conn.transaction():
+        conn.execute("DELETE FROM stockbit_ws.broker_top_daily WHERE date = %s", (date,))
         conn.cursor().executemany(
             """INSERT INTO stockbit_ws.broker_top_daily
                 (date, broker_code, broker_name, total_value, net_value,
@@ -226,7 +225,7 @@ def store_broker_activity(
     broker_code: str,
     activities: list[dict],
 ) -> int:
-    """Upsert broker stock activity ke stockbit_ws.broker_stock_activity.
+    """Replace one broker/date activity snapshot.
     
     Parsing response structure:
     Setiap item di activities memiliki:
@@ -240,8 +239,6 @@ def store_broker_activity(
     
     Returns: jumlah row yang diproses.
     """
-    if not activities:
-        return 0
     aggregated = {}
     for a in activities:
         symbol = a.get("stock_code") or a.get("symbol")
@@ -339,11 +336,16 @@ def store_broker_activity(
             date, broker_code, symbol, net_val, buy_val, sell_val,
             buy_lot, sell_lot, buy_avg, sell_avg, None, None,
         ))
-    if not rows:
-        return 0
+    if activities and not rows:
+        raise ValueError("Broker activity response contains no stock symbol")
     with conn.transaction():
-        conn.cursor().executemany(
-            """INSERT INTO stockbit_ws.broker_stock_activity
+        conn.execute(
+            "DELETE FROM stockbit_ws.broker_stock_activity WHERE date = %s AND broker_code = %s",
+            (date, broker_code),
+        )
+        if rows:
+            conn.cursor().executemany(
+                """INSERT INTO stockbit_ws.broker_stock_activity
                 (date, broker_code, symbol, net_value, buy_value, sell_value,
                  buy_lot, sell_lot, buy_avg_price, sell_avg_price,
                  buy_lot_pct, sell_lot_pct)
@@ -360,8 +362,8 @@ def store_broker_activity(
                 sell_lot_pct = EXCLUDED.sell_lot_pct,
                 fetched_at = now()
             """,
-            rows,
-        )
+                rows,
+            )
     return len(rows)
 
 
@@ -434,6 +436,8 @@ def run_ingestion(
         
         # Step 2: Drill-down top N brokers → fetch activity per saham
         top_codes = [b["code"] for b in brokers[:top_n_brokers] if b.get("code")]
+        # A refresh is incomplete until every requested broker snapshot succeeds.
+        conn.execute("DELETE FROM stockbit_ws.broker_eod_ingestion WHERE date = %s", (date,))
         
         for i, code in enumerate(top_codes, 1):
             time.sleep(REQUEST_DELAY_SECONDS)
@@ -451,8 +455,14 @@ def run_ingestion(
                 continue
 
         if len(top_codes) == top_n_brokers and not stats["errors"] and stats["brokers_processed"] == len(top_codes):
-            conn.execute(
-                """INSERT INTO stockbit_ws.broker_eod_ingestion
+            with conn.transaction():
+                conn.execute(
+                    """DELETE FROM stockbit_ws.broker_stock_activity
+                       WHERE date = %s AND broker_code <> ALL(%s::text[])""",
+                    (date, top_codes),
+                )
+                conn.execute(
+                    """INSERT INTO stockbit_ws.broker_eod_ingestion
                    (date, top_n, brokers_requested, brokers_processed, activities_stored)
                    VALUES (%s, %s, %s, %s, %s)
                    ON CONFLICT (date) DO UPDATE SET
@@ -461,8 +471,8 @@ def run_ingestion(
                      brokers_processed = EXCLUDED.brokers_processed,
                      activities_stored = EXCLUDED.activities_stored,
                      completed_at = now()""",
-                (date, top_n_brokers, len(top_codes), stats["brokers_processed"], stats["activities_stored"]),
-            )
+                    (date, top_n_brokers, len(top_codes), stats["brokers_processed"], stats["activities_stored"]),
+                )
             stats["eod_complete"] = True
             print(f"✅ EOD {date.isoformat()} ditandai lengkap ({len(top_codes)} broker).")
         

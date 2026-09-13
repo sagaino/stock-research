@@ -368,11 +368,25 @@ uv run stockbit-swing --no-l2
 
 # Offline penuh: jangan fetch EOD maupun L2:
 uv run stockbit-swing --no-eod --no-l2
+
+# Baseline EOD sebelum filter L2 (untuk evaluasi, bukan sinyal trading):
+uv run stockbit-swing --date 2026-09-04 --macro-only --no-eod
 ```
 
 **Alur Kerja Otomatis (Targeted L2 Sniper Funnel):**
 1. Mesin memastikan marker EOD tersedia untuk maksimal `--days` tanggal bursa; tanggal yang hilang atau belum lengkap di-fetch lewat Exodus. Weekend/holiday yang tidak mengembalikan data dilewati.
 2. Mesin menyaring broker smart-money net-buy minimal 4/5 hari dan kode ritel net-sell minimal 3/5 hari, dengan total ritel tetap net-sell; lalu mengambil maksimal **25 kandidat** dengan smart-net terbesar.
 3. Jika belum ada penanda scrape L2 lengkap, mesin menyedot tiap kandidat secara targeted; durasi bergantung jumlah tick, bukan angka tetap 30 detik.
-4. Menghasilkan *Swing Trading Plan* dengan harga yang dibulatkan ke fraksi IDX dan stop di bawah rata-rata broker periode.
+4. Menghasilkan *Swing Trading Plan* dengan harga yang dibulatkan ke fraksi IDX dan stop di bawah seluruh area entry.
+Gunakan `--macro-only` hanya untuk membandingkan baseline EOD terhadap hasil setelah filter L2; mode ini tidak menghasilkan rencana entry atau sinyal.
 *Arsip Laporan:* `reports/swing_confluence_YYYYMMDD.md`.
+
+### 5. Backtest Walk-Forward EOD (`stockbit-swing-backtest`)
+
+Backtest ini **tidak memakai L2**. Setiap Jumat membentuk maksimal 25 kandidat dari akumulasi broker EOD lima hari, kemudian mengukur perubahan *close*, *high*, dan *low* pada lima sesi bursa sesudahnya.
+
+```bash
+uv run stockbit-swing-backtest --from 2026-06-29 --to 2026-09-11
+```
+
+Tanggal EOD yang belum lengkap akan diambil otomatis dan snapshot harga harian disimpan di `stockbit_ws.market_daily_prices`, sehingga pengulangan berikutnya tidak perlu mengambil harga yang sama. Hasil adalah evaluasi shortlist—bukan simulasi eksekusi atau jaminan profit—karena fee, spread, slippage, likuiditas entry, dan corporate action tidak dimodelkan.

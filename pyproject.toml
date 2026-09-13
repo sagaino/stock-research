@@ -32,6 +32,7 @@ stockbit-phase3 = "stockbit_ws.phase3_scanner:main"
 stockbit-bsjp-pro = "stockbit_ws.bsjp_confluence:main"
 stockbit-confluence = "stockbit_ws.bsjp_confluence:main"
 stockbit-swing = "stockbit_ws.swing_confluence:main"
+stockbit-swing-backtest = "stockbit_ws.swing_backtest:main"
 
 [tool.setuptools.packages.find]
 include = ["stockbit_ws*"]

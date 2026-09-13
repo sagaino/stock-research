@@ -113,6 +113,18 @@ def initialize_schema(connection):
         )""")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_broker_stock_sym_date ON stockbit_ws.broker_stock_activity(symbol, date DESC)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_broker_top_date ON stockbit_ws.broker_top_daily(date DESC)")
+        connection.execute("""CREATE TABLE IF NOT EXISTS stockbit_ws.market_daily_prices (
+            date date NOT NULL,
+            symbol text NOT NULL,
+            open numeric NOT NULL CHECK(open > 0),
+            high numeric NOT NULL CHECK(high > 0),
+            low numeric NOT NULL CHECK(low > 0),
+            close numeric NOT NULL CHECK(close > 0),
+            source text NOT NULL,
+            fetched_at timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (date, symbol)
+        )""")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_market_daily_prices_symbol_date ON stockbit_ws.market_daily_prices(symbol, date DESC)")
         connection.execute("""CREATE TABLE IF NOT EXISTS stockbit_ws.broker_eod_ingestion (
             date date PRIMARY KEY,
             top_n integer NOT NULL CHECK(top_n > 0),

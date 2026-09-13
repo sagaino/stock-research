@@ -258,6 +258,13 @@ class TestExodusIntegration(unittest.TestCase):
         self.assertEqual(row["net_value"], 500)
         self.assertEqual(row["total_frequency"], 10)
 
+        store_top_brokers(self.conn, self.test_date, [dict(brokers[0], code="KZ")])
+        rows = self.conn.execute(
+            "SELECT broker_code FROM stockbit_ws.broker_top_daily WHERE date = %s",
+            (self.test_date,),
+        ).fetchall()
+        self.assertEqual([item["broker_code"] for item in rows], ["KZ"])
+
     def test_store_broker_activity_upsert_idempotent(self):
         activities = [
             {
@@ -293,6 +300,31 @@ class TestExodusIntegration(unittest.TestCase):
             (self.test_date,)
         ).fetchone()
         self.assertEqual(row["net_value"], 300)
+
+    def test_store_broker_activity_replaces_stale_symbols(self):
+        store_broker_activity(self.conn, self.test_date, "YU", [
+            {"stock_code": "DSSA", "net_val": "100"},
+            {"stock_code": "BBCA", "net_val": "200"},
+        ])
+
+        store_broker_activity(self.conn, self.test_date, "YU", [
+            {"stock_code": "DSSA", "net_val": "300"},
+        ])
+
+        rows = self.conn.execute(
+            """SELECT symbol, net_value
+               FROM stockbit_ws.broker_stock_activity
+               WHERE date = %s AND broker_code = 'YU'""",
+            (self.test_date,),
+        ).fetchall()
+        self.assertEqual([(row["symbol"], float(row["net_value"])) for row in rows], [("DSSA", 300.0)])
+
+        self.assertEqual(store_broker_activity(self.conn, self.test_date, "YU", []), 0)
+        remaining = self.conn.execute(
+            "SELECT count(*) AS count FROM stockbit_ws.broker_stock_activity WHERE date = %s",
+            (self.test_date,),
+        ).fetchone()
+        self.assertEqual(remaining["count"], 0)
 
     def test_store_broker_activity_aggregates_buy_and_sell_rows(self):
         activities = [
