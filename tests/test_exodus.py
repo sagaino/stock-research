@@ -151,6 +151,38 @@ class TestExodusUnit(unittest.TestCase):
             fetch_broker_activity(client, "YU", target_date=datetime.date(2026, 9, 10))
 
     @patch("stockbit_ws.exodus.time.sleep")
+    def test_activity_retries_read_timeout_without_changing_page(self, _sleep):
+        client = MagicMock(spec=httpx.Client)
+        response = MagicMock()
+        response.json.return_value = {
+            "data": {
+                "broker_activity_transaction": {
+                    "brokers_buy": [{"stock_code": "ANTM", "value": 100}],
+                    "brokers_sell": [],
+                }
+            }
+        }
+        empty = MagicMock()
+        empty.json.return_value = {"data": {}}
+        client.get.side_effect = [
+            httpx.ReadTimeout(
+                "timed out",
+                request=httpx.Request("GET", "https://exodus.stockbit.com/order-trade/broker/activity"),
+            ),
+            response,
+            empty,
+        ]
+
+        rows = fetch_broker_activity(client, "CC", target_date=datetime.date(2026, 9, 10))
+
+        self.assertEqual([row["stock_code"] for row in rows], ["ANTM"])
+        self.assertEqual(client.get.call_count, 3)
+        self.assertEqual(
+            client.get.call_args_list[0].kwargs["params"],
+            client.get.call_args_list[1].kwargs["params"],
+        )
+
+    @patch("stockbit_ws.exodus.time.sleep")
     def test_relative_activity_keeps_period_compatibility(self, _sleep):
         client = MagicMock(spec=httpx.Client)
         response = MagicMock()

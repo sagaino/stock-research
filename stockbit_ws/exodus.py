@@ -53,6 +53,26 @@ def _exodus_client(token: str) -> httpx.Client:
     )
 
 
+def _get_with_timeout_retry(
+    client: httpx.Client,
+    path: str,
+    *,
+    params: dict[str, Any],
+    label: str,
+) -> httpx.Response:
+    """GET ulang saat timeout, tanpa mengubah request yang gagal."""
+    for retry in range(MAX_RETRIES + 1):
+        try:
+            return client.get(path, params=params)
+        except httpx.TimeoutException:
+            if retry == MAX_RETRIES:
+                raise
+            print(f"   ⚠️  {label}: timeout, mencoba ulang ({retry + 1}/{MAX_RETRIES})...")
+            time.sleep(REQUEST_DELAY_SECONDS)
+
+    raise AssertionError("unreachable")
+
+
 def fetch_top_brokers(
     client: httpx.Client,
     date: datetime.date,
@@ -71,7 +91,8 @@ def fetch_top_brokers(
     endpoint may ignore its sort/limit parameters.
     Raises: httpx.HTTPStatusError pada 4xx/5xx
     """
-    resp = client.get(
+    resp = _get_with_timeout_retry(
+        client,
         "/order-trade/broker/top",
         params={
             "sort": "TB_SORT_BY_TOTAL_VALUE",
@@ -80,6 +101,7 @@ def fetch_top_brokers(
             "to": date.isoformat(),
             "market_type": "MARKET_TYPE_REGULER",
         },
+        label=f"Top broker {date.isoformat()}",
     )
     resp.raise_for_status()
     data = resp.json()
@@ -138,9 +160,11 @@ def fetch_broker_activity(
             params["from"] = target_date.isoformat()
             params["to"] = target_date.isoformat()
 
-        resp = client.get(
+        resp = _get_with_timeout_retry(
+            client,
             "/order-trade/broker/activity",
             params=params,
+            label=f"Broker {broker_code}",
         )
         resp.raise_for_status()
         data = resp.json()

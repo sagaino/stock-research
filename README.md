@@ -383,10 +383,31 @@ Gunakan `--macro-only` hanya untuk membandingkan baseline EOD terhadap hasil set
 
 ### 5. Backtest Walk-Forward EOD (`stockbit-swing-backtest`)
 
-Backtest ini **tidak memakai L2**. Setiap Jumat membentuk maksimal 25 kandidat dari akumulasi broker EOD lima hari, kemudian mengukur perubahan *close*, *high*, dan *low* pada lima sesi bursa sesudahnya.
+Backtest ini **tidak memakai L2**. Setiap Jumat memastikan lima snapshot EOD pada sesi IDX yang valid, membentuk kandidat broker, lalu mensimulasikan entry pada *open* sesi berikutnya. Hari libur IDX ditandai eksplisit; weekday yang seharusnya sesi tetapi EOD-nya tidak lengkap menghentikan fold agar tidak diganti tanggal lama. Target `+7%`, stop di bawah average buy broker/entry, dan *time exit* lima sesi dihitung bersama fee dan slippage konservatif.
 
 ```bash
 uv run stockbit-swing-backtest --from 2026-06-29 --to 2026-09-11
 ```
 
-Tanggal EOD yang belum lengkap akan diambil otomatis dan snapshot harga harian disimpan di `stockbit_ws.market_daily_prices`, sehingga pengulangan berikutnya tidak perlu mengambil harga yang sama. Hasil adalah evaluasi shortlist—bukan simulasi eksekusi atau jaminan profit—karena fee, spread, slippage, likuiditas entry, dan corporate action tidak dimodelkan.
+Tanggal EOD yang belum lengkap akan diambil otomatis dan snapshot harga harian disimpan di `stockbit_ws.market_daily_prices`, sehingga pengulangan berikutnya tidak perlu mengambil harga yang sama. Secara default, kandidat harus berada maksimal 6% di atas average buy broker, maksimal lima posisi dipilih per minggu, dan nilai transaksi Top-20 broker harus mencakup minimal 80% dari seluruh nilai broker hari tersebut.
+
+```bash
+# Ubah asumsi simulasi bila fee broker atau batas risiko Anda berbeda:
+uv run stockbit-swing-backtest --from 2026-06-29 --to 2026-09-11 \
+  --max-margin 6 --max-positions 5 --fee-buy 0.15 --fee-sell 0.25 \
+  --slippage-ticks 1 --min-coverage 80 --validation-from 2026-08-14
+```
+
+Untuk mengulang variasi holding panjang yang diuji, gunakan stop dan target statis berikut:
+
+```bash
+# 10 sesi IDX, SL -10%, TP +20%
+uv run stockbit-swing-backtest --from 2026-01-01 --to 2026-09-13 --no-eod \
+  --hold-sessions 10 --stop-loss 10 --take-profit 20 --validation-from 2026-06-01
+
+# 15 sesi IDX, SL -10%, TP +20%
+uv run stockbit-swing-backtest --from 2026-01-01 --to 2026-09-13 --no-eod \
+  --hold-sessions 15 --stop-loss 10 --take-profit 20 --validation-from 2026-06-01
+```
+
+`--validation-from` membagi laporan menjadi periode kalibrasi dan validasi dengan parameter yang sama; hasil validasi tidak dipakai untuk tuning ulang. Laporan menghitung **profit factor net** (gross profit ÷ gross loss) setelah fee dan slippage. Quality gate default hanya lolos bila periode validasi memiliki minimal 30 trade dan profit factor ≥ 1,20; gunakan `--enforce-profit-factor` untuk menjadikannya status gagal pada otomasi. Laporan juga mencantumkan audit kandidat yang tidak menjadi trade. Jika TP dan SL tersentuh dalam candle harian yang sama, backtest menganggap SL. Hasil masih bukan jaminan eksekusi atau profit: corporate action, antrean, partial fill, dan market impact belum dimodelkan.

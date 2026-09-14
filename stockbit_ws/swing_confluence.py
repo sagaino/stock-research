@@ -14,6 +14,7 @@ from typing import Any
 
 from stockbit_ws.postgres import connect_database, initialize_schema
 from stockbit_ws.broker_groups import broker_group
+from stockbit_ws.idx_calendar import closure_reason, is_idx_session
 from stockbit_ws.sniper import get_idx_tick_size, round_to_idx_tick
 
 DEFAULT_EOD_TOP_N = 20
@@ -67,6 +68,7 @@ def run_swing_confluence(
     auto_fetch_l2: bool = True,
     auto_fetch_eod: bool = True,
     macro_only: bool = False,
+    macro_limit: int | None = 25,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Execute multi-day accumulation + Day-T microstructure confluence."""
     try:
@@ -77,29 +79,24 @@ def run_swing_confluence(
     initialize_schema(conn)
     cur = conn.cursor()
 
-    # 1. Ensure the requested EOD lookback has complete ingestion markers.
-    #    Missing weekdays are probed through Exodus; weekends/holidays simply
-    #    return no top-broker rows and are skipped.
-    if auto_fetch_eod:
-        from stockbit_ws.exodus import run_ingestion
-
-        complete_dates = set(
-            row["date"].isoformat()
-            for row in cur.execute(
-                """SELECT date FROM stockbit_ws.broker_eod_ingestion
-                   WHERE date <= %s AND top_n >= %s
+    # 1. Walk back through known IDX sessions. A missing marker on an expected
+    #    session stops screening instead of silently using an older session.
+    from stockbit_ws.exodus import run_ingestion
+    resolved_dates = []
+    cursor_date = datetime.date.fromisoformat(target_date)
+    scanned_days = 0
+    while len(resolved_dates) < lookback_days and scanned_days < MAX_EOD_CALENDAR_SCAN_DAYS:
+        date_str = cursor_date.isoformat()
+        marker = None
+        if is_idx_session(cursor_date):
+            marker = cur.execute(
+                """SELECT 1 FROM stockbit_ws.broker_eod_ingestion
+                   WHERE date = %s AND top_n >= %s
                      AND brokers_requested >= %s
-                     AND brokers_processed >= brokers_requested
-                   ORDER BY date DESC LIMIT %s""",
-                (target_date, DEFAULT_EOD_TOP_N, DEFAULT_EOD_TOP_N, lookback_days),
-            ).fetchall()
-        )
-        cursor_date = datetime.date.fromisoformat(target_date)
-        target_needs_probe = cursor_date.weekday() < 5 and target_date not in complete_dates
-        scanned_days = 0
-        while (len(complete_dates) < lookback_days or target_needs_probe) and scanned_days < MAX_EOD_CALENDAR_SCAN_DAYS:
-            date_str = cursor_date.isoformat()
-            if cursor_date.weekday() < 5 and date_str not in complete_dates:
+                     AND brokers_processed >= brokers_requested""",
+                (date_str, DEFAULT_EOD_TOP_N, DEFAULT_EOD_TOP_N),
+            ).fetchone()
+            if not marker and auto_fetch_eod:
                 print(f"📡 [EOD] Memastikan aktivitas broker untuk {date_str}...")
                 try:
                     run_ingestion(date=cursor_date, top_n_brokers=DEFAULT_EOD_TOP_N)
@@ -113,41 +110,24 @@ def run_swing_confluence(
                          AND brokers_processed >= brokers_requested""",
                     (date_str, DEFAULT_EOD_TOP_N, DEFAULT_EOD_TOP_N),
                 ).fetchone()
-                if marker:
-                    complete_dates.add(date_str)
-                if date_str == target_date:
-                    target_needs_probe = not marker
-            cursor_date -= datetime.timedelta(days=1)
-            scanned_days += 1
-        date_rows = cur.execute(
-            """SELECT date FROM stockbit_ws.broker_eod_ingestion
-               WHERE date <= %s AND top_n >= %s
-                 AND brokers_requested >= %s
-                 AND brokers_processed >= brokers_requested
-               ORDER BY date DESC LIMIT %s""",
-            (target_date, DEFAULT_EOD_TOP_N, DEFAULT_EOD_TOP_N, lookback_days),
-        ).fetchall()
-        if target_needs_probe:
-            print(f"⚠️ EOD target {target_date} belum lengkap; screening dihentikan.")
-            conn.close()
-            return [], []
-    else:
-        # Offline mode keeps the legacy behavior and uses whatever rows exist.
-        date_rows = cur.execute("""
-            SELECT DISTINCT date
-            FROM stockbit_ws.broker_stock_activity
-            WHERE date <= %s
-            ORDER BY date DESC
-            LIMIT %s
-        """, (target_date, lookback_days)).fetchall()
-    
-    if not date_rows:
+            if marker:
+                resolved_dates.append(date_str)
+            else:
+                print(f"⚠️ EOD {date_str} belum lengkap; screening dihentikan agar tidak memakai tanggal pengganti.")
+                conn.close()
+                return [], sorted(resolved_dates)
+        elif closure_reason(cursor_date):
+            print(f"📅 [EOD] {date_str}: libur IDX ({closure_reason(cursor_date)}).")
+        cursor_date -= datetime.timedelta(days=1)
+        scanned_days += 1
+
+    if not resolved_dates:
         conn.close()
         return [], []
-
-    resolved_dates = sorted([r["date"].isoformat() for r in date_rows])
+    resolved_dates.sort()
     num_days = len(resolved_dates)
-    if num_days < 2:
+    if num_days < lookback_days:
+        print(f"⚠️ Hanya {num_days}/{lookback_days} hari EOD berurutan tersedia; screening dihentikan.")
         conn.close()
         return [], resolved_dates
 
@@ -266,11 +246,12 @@ def run_swing_confluence(
         }
 
     # 3B. Targeted L2 Auto-Fetch for Top Candidates (up to 25 symbols)
-    top_candidate_syms = sorted(
+    ranked_candidate_syms = sorted(
         macro_candidates,
         key=lambda s: macro_candidates[s]["smart_net"],
         reverse=True,
-    )[:25]
+    )
+    top_candidate_syms = ranked_candidate_syms if macro_only and macro_limit is None else ranked_candidate_syms[:macro_limit]
     if not top_candidate_syms:
         conn.close()
         return [], resolved_dates
